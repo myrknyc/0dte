@@ -3,9 +3,9 @@ Signal Generator - SPY 0DTE
 Shows trading signals - YOU decide whether to trade
 """
 
-import yfinance as yf
 import numpy as np
 from trading.trading_system import TradingSystem
+from data.data_provider import select_provider
 from signals.signal_logger import SignalLogger
 from datetime import datetime
 
@@ -58,8 +58,9 @@ def main():
     print(f"Time: {datetime.now().strftime('%H:%M:%S')}")
     print()
     
-    # Initialize trading system & logger
-    trader = TradingSystem('SPY')
+    # Initialize
+    provider = select_provider()
+    trader = TradingSystem('SPY', provider=provider)
     trader.calibrate_to_market()
     logger = SignalLogger()
     
@@ -81,24 +82,21 @@ def main():
     bs_atm = black_scholes(trader.S0, atm_strike, T, RISK_FREE_RATE, np.sqrt(trader.v0), 'call')
     print(f"  BS ATM sanity ({atm_strike}C): ${bs_atm:.4f}")
     
-    # Get market data — explicitly request today's 0DTE expiry
-    spy = yf.Ticker('SPY')
+    # Get option chain from the selected provider
     today = datetime.now().strftime('%Y-%m-%d')
-    
     try:
-        options = spy.option_chain(today)
-        calls = options.calls
+        chain = provider.get_option_chain('SPY', expiry_date=today)
+        calls = chain['calls']
         print(f"✓ Using 0DTE options expiring today ({today})")
     except Exception as e:
         print(f"\n⚠ No 0DTE options for {today}: {e}")
         print("Falling back to nearest expiry...")
         try:
-            options = spy.option_chain()
-            calls = options.calls
-            print(f"  Using expiry: {spy.options[0]}")
+            chain = provider.get_option_chain('SPY')
+            calls = chain['calls']
+            print(f"  Using expiry: {chain['expiry_date']}")
         except Exception as e2:
             print(f"\n❌ Error fetching option data: {e2}")
-            print("Note: yfinance has 15-min delay")
             return
     
     # Check strikes near ATM

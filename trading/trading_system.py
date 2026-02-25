@@ -3,9 +3,10 @@ from datetime import datetime
 
 from config import (
     DEFAULT_PARAMS, RISK_FREE_RATE, N_PATHS_DEFAULT, N_STEPS_0DTE,
-    TRADING_DAYS_PER_YEAR, get_time_to_expiry, USE_ANTITHETIC
+    TRADING_DAYS_PER_YEAR, get_time_to_expiry, USE_ANTITHETIC,
+    TRADING_THRESHOLDS
 )
-from data.data_loader import DataLoader
+from data.data_provider import MarketDataProvider, get_provider
 from pricing.black_scholes import black_scholes
 
 from core.time_grid import generate_time_grid
@@ -18,9 +19,9 @@ from calibration.mean_reversion_calibrator import calibrate_from_intraday
 
 
 class TradingSystem:
-    def __init__(self, ticker='SPY'):
+    def __init__(self, ticker='SPY', provider: MarketDataProvider = None):
         self.ticker = ticker
-        self.loader = DataLoader(ticker)
+        self.provider = provider or get_provider('yfinance')
         
         # Market state
         self.S0 = None
@@ -46,19 +47,22 @@ class TradingSystem:
             print(f"{'='*60}")
         
         # 1. Get current spot price
-        self.S0 = self.loader.get_spot_price()
+        self.S0 = self.provider.get_spot_price(self.ticker)
         
         # 2. Get intraday data for calibration
-        self.loader.get_intraday_data()
+        from config import YF_PERIOD, YF_INTERVAL
+        self._intraday = self.provider.get_intraday_data(
+            self.ticker, period=YF_PERIOD, interval=YF_INTERVAL
+        )
         
         # 3. Compute VWAP
-        self.vwap = self.loader.compute_vwap()
+        self.vwap = self.provider.compute_vwap(self._intraday)
         
         # 4. Get historical volatility
-        self.historical_vol = self.loader.get_historical_volatility()
+        self.historical_vol = self.provider.get_historical_volatility(self._intraday)
         
         # 5. Calibrate Heston parameters
-        prices = self.loader.intraday_data['Close'].values
+        prices = self._intraday['Close'].values
         # Intraday 1-min data → annualize with 252 * 390 periods per year
         heston_params = calibrate_to_realized_vol(prices, periods_per_year=252 * 390)
         
@@ -105,7 +109,7 @@ class TradingSystem:
         
         # 6. Calibrate jump parameters
         # Returns are 1-minute bars → dt must match that frequency
-        returns = self.loader.compute_returns()
+        returns = self.provider.compute_returns(self._intraday)
         intraday_dt = 1.0 / (TRADING_DAYS_PER_YEAR * 390)  # 1-min bar in trading years
         jump_params = calibrate_from_returns(returns, dt=intraday_dt)
         
@@ -119,7 +123,7 @@ class TradingSystem:
         
         # 7. Calibrate mean reversion
         mr_params = calibrate_from_intraday(
-            self.loader.intraday_data, 
+            self._intraday,
             self.vwap
         )
         
@@ -302,10 +306,10 @@ class TradingSystem:
         market_mid = (market_bid + market_ask) / 2
         spread = market_ask - market_bid
         
-        # 1. LIQUIDITY FILTER
-        # If spread is too wide (> $0.10 or > 10% of price), don't trade
-        max_spread = 0.10
-        if spread > max_spread and spread / market_mid > 0.10:
+        # 1. LIQUIDITY FILTER  (thresholds from config)
+        max_spread = TRADING_THRESHOLDS['max_spread']
+        max_spread_pct = TRADING_THRESHOLDS['max_spread_pct']
+        if spread > max_spread and spread / market_mid > max_spread_pct:
             return {
                 'action': 'HOLD',
                 'edge': 0.0,
@@ -357,14 +361,16 @@ class TradingSystem:
             r_bs = self.params.get('r', RISK_FREE_RATE)
             bs_check = black_scholes(self.S0, strike, get_time_to_expiry(), 
                                      r_bs, np.sqrt(self.v0), option_type)
-            if bs_check > 0 and abs(model_price - bs_check) / bs_check > 0.50:
-                confidence = min(confidence, 0.30)
+            bs_div_cap = TRADING_THRESHOLDS['bs_divergence_cap']
+            bs_div_conf = TRADING_THRESHOLDS['bs_divergence_conf']
+            if bs_check > 0 and abs(model_price - bs_check) / bs_check > bs_div_cap:
+                confidence = min(confidence, bs_div_conf)
         else:
             confidence = 0.0
         
-        # 4. TRADING THRESHOLDS
-        min_edge = 0.02  # 2% edge required
-        min_confidence = 0.5
+        # 4. TRADING THRESHOLDS  (from config)
+        min_edge = TRADING_THRESHOLDS['min_edge']
+        min_confidence = TRADING_THRESHOLDS['min_confidence']
         
 
         if action_candidate != 'HOLD' and edge > min_edge and confidence >= min_confidence:

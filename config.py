@@ -41,6 +41,24 @@ N_STEPS_0DTE = 200          # More steps for 0DTE
 
 USE_ANTITHETIC = True #variance reduction
 
+# --- Trading thresholds (configurable; previously hardcoded) ---
+TRADING_THRESHOLDS = {
+    'min_edge': 0.02,           # Minimum edge required (2%)
+    'min_confidence': 0.50,     # Minimum confidence score (0-1)
+    'max_spread': 0.10,         # Maximum absolute spread ($)
+    'max_spread_pct': 0.10,     # Maximum spread as % of mid
+    'bs_divergence_cap': 0.50,  # Cap confidence if model diverges > 50% from BS
+    'bs_divergence_conf': 0.30, # Confidence cap value when BS divergence triggers
+}
+
+# --- Risk manager defaults ---
+RISK_DEFAULTS = {
+    'sl_pct': 0.50,             # Default stop-loss percentage (50%)
+    'tp_pct': 1.00,             # Default take-profit percentage (100%)
+    'close_time': (15, 45),     # Hard time exit (3:45 PM) as (hour, minute)
+    'max_daily_loss': 500,      # Maximum daily loss in dollars
+}
+
 #optimize
 HESTON_BOUNDS = [
     (0.1, 10.0),      # kappa

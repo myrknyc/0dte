@@ -1,5 +1,6 @@
 from datetime import datetime, time
 from typing import Dict, List, Optional
+from config import RISK_DEFAULTS
 
 class Position:    
     def __init__(self, symbol: str, entry_price: float, quantity: int):
@@ -44,11 +45,12 @@ class Position:
 class FlexibleRiskManager:
     
     def __init__(self):
-        # Default automated rules
-        self.default_sl_pct = 0.50   # 50% loss
-        self.default_tp_pct = 1.00   # 100% gain
-        self.close_time = time(15, 45)  # 3:45 PM
-        self.max_daily_loss = 500
+        # Automated rules from config (override by passing kwargs)
+        self.default_sl_pct = RISK_DEFAULTS['sl_pct']
+        self.default_tp_pct = RISK_DEFAULTS['tp_pct']
+        _ct = RISK_DEFAULTS['close_time']
+        self.close_time = time(_ct[0], _ct[1])
+        self.max_daily_loss = RISK_DEFAULTS['max_daily_loss']
         
         self.positions: Dict[str, Position] = {}
         self.daily_pnl = 0

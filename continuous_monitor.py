@@ -4,7 +4,7 @@ from datetime import datetime, time as dt_time
 from typing import Dict
 import threading
 
-from data.streaming_data_feed import StreamingDataFeed
+from data.data_provider import MarketDataProvider, select_provider, IBKRProvider
 from trading.trading_system import TradingSystem
 from signals.signal_logger import SignalLogger
 from calibration.heston_calibrator import calibrate_heston_live
@@ -13,15 +13,23 @@ from config import get_time_to_expiry
 
 
 class ContinuousTradingMonitor:
-    def __init__(self, ticker='SPY', recalibrate_minutes=30, edge_threshold=0.02):
+    def __init__(self, ticker='SPY', recalibrate_minutes=30, edge_threshold=0.02,
+                 provider: MarketDataProvider = None):
         self.ticker = ticker
         self.recalibrate_minutes = recalibrate_minutes
         self.edge_threshold = edge_threshold
         
+        # Data provider (chosen at startup)
+        self.provider = provider
+        
         # Initialize components
-        self.stream = StreamingDataFeed()
-        self.trader = TradingSystem(ticker)
+        self.trader = TradingSystem(ticker, provider=self.provider)
         self.logger = SignalLogger()
+        
+        # For IBKR: keep reference to the streaming feed for live updates
+        self._ibkr_feed = None
+        if isinstance(self.provider, IBKRProvider):
+            self._ibkr_feed = self.provider.feed
         
         # State
         self.last_calibration = None
@@ -33,10 +41,12 @@ class ContinuousTradingMonitor:
     def connect(self):
         print("Initializing continuous trading monitor...")
         
-        if not self.stream.connect():
-            return False
+        # IBKR: ensure connection is up
+        if self._ibkr_feed and not self._ibkr_feed.is_connected:
+            if not self._ibkr_feed.connect():
+                return False
         
-        # Initial calibration
+        # Initial calibration (uses provider automatically)
         print("\nPerforming initial calibration...")
         self.trader.calibrate_to_market()
         self.last_calibration = datetime.now()
@@ -71,32 +81,38 @@ class ContinuousTradingMonitor:
         
         print(f"\n{datetime.now().strftime('%H:%M:%S')} - Scanning {len(strikes)} strikes...")
         
-        # Get option chain from IB
+        # Get option chain from provider
         try:
-            option_chain = self.stream.get_option_chain(self.ticker)
+            chain = self.provider.get_option_chain(self.ticker)
             
-            if option_chain is None:
+            if chain is None:
+                return
+            
+            calls = chain.get('calls')
+            if calls is None or calls.empty:
                 return
             
             signals_found = []
             T = get_time_to_expiry()
             
             for strike in strikes:
-                chain_row = option_chain[option_chain['strike'] == strike]
+                chain_row = calls[calls['strike'] == strike]
                 
                 if len(chain_row) == 0:
                     continue
                 
                 row = chain_row.iloc[0]
                 
-                # Check calls
-                if row['call_bid'] > 0 and row['call_ask'] > 0:
-                    mkt_iv = row.get('call_iv', None)
+                # Check calls — handle both yfinance and IBKR column names
+                bid_col = 'bid' if 'bid' in row.index else 'call_bid'
+                ask_col = 'ask' if 'ask' in row.index else 'call_ask'
+                if row[bid_col] > 0 and row[ask_col] > 0:
+                    mkt_iv = row.get('impliedVolatility', row.get('call_iv', None))
                     
                     signal = self.trader.get_trading_signal(
                         strike=strike,
-                        market_bid=row['call_bid'],
-                        market_ask=row['call_ask'],
+                        market_bid=row[bid_col],
+                        market_ask=row[ask_col],
                         option_type='call',
                         market_iv=mkt_iv
                     )
@@ -110,8 +126,8 @@ class ContinuousTradingMonitor:
                         edge=signal['edge'],
                         confidence=signal['confidence'],
                         model_price=signal['model_price'],
-                        market_bid=row['call_bid'],
-                        market_ask=row['call_ask'],
+                        market_bid=row[bid_col],
+                        market_ask=row[ask_col],
                         market_mid=signal['market_mid'],
                         spread=signal['spread'],
                         std_error=signal['std_error'],
@@ -163,8 +179,12 @@ class ContinuousTradingMonitor:
         print(f"Edge threshold: {self.edge_threshold*100:.1f}%")
         print(f"{'='*60}\n")
         
-        # Subscribe to price updates
-        self.stream.subscribe_stock(self.ticker, self._on_price_update)
+        # Subscribe to price updates (IBKR: real-time; yfinance: poll)
+        if self._ibkr_feed:
+            self._ibkr_feed.subscribe_stock(self.ticker, self._on_price_update)
+        else:
+            # yfinance: update price at each scan cycle
+            pass
         
         self.running = True
         
@@ -187,11 +207,21 @@ class ContinuousTradingMonitor:
                 seconds_since_scan = (datetime.now() - last_scan).seconds
                 
                 if seconds_since_scan >= scan_interval_seconds:
+                    # For yfinance: refresh spot price each cycle
+                    if not self._ibkr_feed:
+                        try:
+                            self.current_price = self.provider.get_spot_price(self.ticker)
+                            self.trader.S0 = self.current_price
+                        except Exception:
+                            pass
                     self.scan_strikes()
                     last_scan = datetime.now()
                 
-                # Process IB events (non-blocking)
-                self.stream.ib.sleep(1)
+                # Process events
+                if self._ibkr_feed:
+                    self._ibkr_feed.ib.sleep(1)
+                else:
+                    time.sleep(1)
                 
         except KeyboardInterrupt:
             print("\n\nStopping monitor...")
@@ -202,7 +232,8 @@ class ContinuousTradingMonitor:
         self.running = False
         self.logger.summary(datetime.now().strftime('%Y-%m-%d'))
         self.logger.close()
-        self.stream.disconnect()
+        if self._ibkr_feed:
+            self._ibkr_feed.disconnect()
         print("Monitor stopped")
 
 
@@ -212,22 +243,25 @@ if __name__ == "__main__":
     print("0DTE CONTINUOUS TRADING MONITOR")
     print("="*60)
     print("\nREQUIREMENTS:")
-    print("  1. Interactive Brokers account")
-    print("  2. TWS or IB Gateway running")
-    print("  3. API enabled in TWS settings")
+    print("  • For IBKR: TWS or IB Gateway running with API enabled")
+    print("  • For yfinance: internet connection (15-min delayed)")
     print("\n" + "="*60 + "\n")
     
-    # Create monitor
+    # Let user choose data source
+    provider = select_provider()
+    
+    # Create monitor with chosen provider
     monitor = ContinuousTradingMonitor(
         ticker='SPY',
-        recalibrate_minutes=30,  # Recalibrate every 30 min
-        edge_threshold=0.02      # 2% min edge
+        recalibrate_minutes=30,
+        edge_threshold=0.02,
+        provider=provider
     )
     
     # Connect and start
     if monitor.connect():
-        print("\n✓ Connected and calibrated")
+        print(f"\n✓ Connected and calibrated (using {provider.name})")
         print("Starting continuous monitoring...\n")
-        monitor.start(scan_interval_seconds=60)  # Scan every 60 seconds
+        monitor.start(scan_interval_seconds=60)
     else:
-        print("\n❌ Failed to connect. Check IB setup.")
+        print("\n❌ Failed to connect. Check your setup.")

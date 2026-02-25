@@ -1,4 +1,4 @@
-import yfinance as yf
+# yfinance imported lazily inside DataLoader.__init__
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -13,6 +13,7 @@ from config import (
 class DataLoader:
     
     def __init__(self, ticker="SPY"):
+        import yfinance as yf
         self.ticker = ticker
         self.yf_ticker = yf.Ticker(ticker)
         self.spot_price = None

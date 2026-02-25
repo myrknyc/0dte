@@ -2,12 +2,12 @@ import numpy as np
 from scipy.optimize import minimize
 from scipy.stats import norm
 import warnings
-import yfinance as yf
 
 from config import JUMP_THRESHOLD, TRADING_DAYS_PER_YEAR
 
 
 def calibrate_jumps_live(ticker='SPY', lookback_days=60):
+    import yfinance as yf
     print(f"Analyzing {ticker} returns for jump detection...")
     
     try:

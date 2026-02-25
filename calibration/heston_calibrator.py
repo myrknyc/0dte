@@ -2,13 +2,13 @@ import numpy as np
 from scipy.optimize import minimize, differential_evolution
 from scipy.stats import norm
 import warnings
-import yfinance as yf
 
 from pricing.black_scholes import black_scholes
 from config import HESTON_BOUNDS, RISK_FREE_RATE
 
 
 def calibrate_heston_live(ticker='SPY', lookback_days=60):
+    import yfinance as yf
     print(f"Fetching {lookback_days} days of {ticker} data...")
     
     try:
@@ -71,7 +71,11 @@ def estimate_price_vol_correlation(prices, window=60):
         rho = -0.7  # Default leverage effect
     
     # Ensure reasonable bounds
+    rho_raw = rho
     rho = np.clip(rho, -0.99, -0.1)
+    if rho != rho_raw:
+        print(f"  ⚠ ρ clipped: raw={rho_raw:.4f} → {rho:.2f}  "
+              f"(bounds -0.99 to -0.1)")
     
     return rho
 
@@ -132,8 +136,11 @@ def calibrate_to_realized_vol(price_history, method='moment_matching',
         
         # Convert to continuous time mean reversion
         if 0 < beta < 1:
-            kappa = -np.log(beta) * kappa_periods_per_year
-            kappa = np.clip(kappa, 0.1, 10.0)
+            kappa_raw = -np.log(beta) * kappa_periods_per_year
+            kappa = np.clip(kappa_raw, 0.1, 10.0)
+            if kappa != kappa_raw:
+                print(f"  ⚠ κ clipped: raw={kappa_raw:.2f} → {kappa:.2f}  "
+                      f"(bounds 0.1–10.0). AR(1) β={beta:.4f}")
         else:
             kappa = 2.0  # Default
     else:
@@ -141,8 +148,11 @@ def calibrate_to_realized_vol(price_history, method='moment_matching',
     
     # [4] Estimate volatility of volatility (σ_v)
     if len(realized_vars) > 1:
-        vol_of_vol = np.std(np.diff(realized_vars), ddof=1) * np.sqrt(kappa_periods_per_year)
-        sigma_v = np.clip(vol_of_vol, 0.1, 2.0)
+        vol_of_vol_raw = np.std(np.diff(realized_vars), ddof=1) * np.sqrt(kappa_periods_per_year)
+        sigma_v = np.clip(vol_of_vol_raw, 0.1, 2.0)
+        if sigma_v != vol_of_vol_raw:
+            print(f"  ⚠ σ_v clipped: raw={vol_of_vol_raw:.4f} → {sigma_v:.2f}  "
+                  f"(bounds 0.1–2.0)")
     else:
         sigma_v = 0.3  # Default
     
