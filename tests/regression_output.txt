@@ -1,0 +1,136 @@
+============================= test session starts =============================
+platform win32 -- Python 3.13.3, pytest-9.0.2, pluggy-1.6.0 -- C:\Users\henry\AppData\Local\Programs\Python\Python313\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\henry\OneDrive\Desktop\PYTHON projects\0dte
+plugins: anyio-4.9.0
+collecting ... collected 66 items
+
+tests/test_paper_trading.py::TestFillModel::test_fill_mid PASSED         [  1%]
+tests/test_paper_trading.py::TestFillModel::test_fill_touch_buy PASSED   [  3%]
+tests/test_paper_trading.py::TestFillModel::test_fill_touch_sell PASSED  [  4%]
+tests/test_paper_trading.py::TestFillModel::test_fill_slippage_buy PASSED [  6%]
+tests/test_paper_trading.py::TestFillModel::test_fill_slippage_sell PASSED [  7%]
+tests/test_paper_trading.py::TestFillModel::test_commission_calc PASSED  [  9%]
+tests/test_paper_trading.py::TestPnLCalculation::test_pnl_buy_win PASSED [ 10%]
+tests/test_paper_trading.py::TestPnLCalculation::test_pnl_buy_loss PASSED [ 12%]
+tests/test_paper_trading.py::TestPnLCalculation::test_pnl_sell_win PASSED [ 13%]
+tests/test_paper_trading.py::TestPnLCalculation::test_pnl_sell_loss PASSED [ 15%]
+tests/test_paper_trading.py::TestExitLogic::test_tp_exit_on_option_quote PASSED [ 16%]
+tests/test_paper_trading.py::TestExitLogic::test_sl_exit_on_option_quote PASSED [ 18%]
+tests/test_paper_trading.py::TestExitLogic::test_eod_exit PASSED         [ 19%]
+tests/test_paper_trading.py::TestExitLogic::test_time_exit PASSED        [ 21%]
+tests/test_paper_trading.py::TestEligibility::test_eligibility_filters PASSED [ 22%]
+tests/test_paper_trading.py::TestEligibility::test_selection_risk_adjusted PASSED [ 24%]
+tests/test_paper_trading.py::TestDecisionLogic::test_decision_fires_once PASSED [ 25%]
+tests/test_paper_trading.py::TestDecisionLogic::test_cooldown_same_direction PASSED [ 27%]
+tests/test_paper_trading.py::TestDecisionLogic::test_cooldown_allows_flip PASSED [ 28%]
+tests/test_paper_trading.py::TestDecisionLogic::test_max_positions PASSED [ 30%]
+tests/test_paper_trading.py::TestDecisionLogic::test_min_strike_spacing PASSED [ 31%]
+tests/test_paper_trading.py::TestQuoteTapeAndStats::test_quote_tape_forward_returns PASSED [ 33%]
+tests/test_paper_trading.py::TestQuoteTapeAndStats::test_eod_summary_stats PASSED [ 34%]
+tests/test_paper_trading.py::TestTrackB::test_track_b_ignores_thresholds PASSED [ 36%]
+tests/test_paper_trading.py::TestTrackB::test_track_b_dedup PASSED       [ 37%]
+tests/test_paper_trading.py::TestTrackB::test_track_b_fixed_horizon_exit PASSED [ 39%]
+tests/test_paper_trading.py::TestTrackB::test_eod_report_per_track PASSED [ 40%]
+tests/test_paper_trading.py::TestTrackB::test_forward_eval_per_track PASSED [ 42%]
+tests/test_paper_trading.py::TestSchema::test_journal_schema PASSED      [ 43%]
+tests/test_spot_freshness.py::TestSpotReturnType::test_yfinance_returns_dict PASSED [ 45%]
+tests/test_spot_freshness.py::TestFreshnessGate::test_fresh_spot_allows_signal PASSED [ 46%]
+tests/test_spot_freshness.py::TestFreshnessGate::test_stale_spot_returns_hold PASSED [ 48%]
+tests/test_spot_freshness.py::TestFreshnessGate::test_none_timestamp_treated_as_stale PASSED [ 50%]
+tests/test_spot_freshness.py::TestCacheInvalidation::test_cache_reused_when_spot_stable PASSED [ 51%]
+tests/test_spot_freshness.py::TestCacheInvalidation::test_cache_invalidated_on_big_spot_move PASSED [ 53%]
+tests/test_spot_freshness.py::TestCacheInvalidation::test_cache_kept_on_small_spot_move PASSED [ 54%]
+tests/test_spot_freshness.py::TestUpdateSpot::test_update_spot_updates_fields PASSED [ 56%]
+tests/test_spot_freshness.py::TestSignalLoggerTimestamps::test_log_signal_with_timestamps PASSED [ 57%]
+tests/test_spot_freshness.py::TestSignalLoggerTimestamps::test_log_signal_without_timestamps PASSED [ 59%]
+tests/test_spot_freshness.py::TestConfigConstants::test_spot_max_age_exists PASSED [ 60%]
+tests/test_spot_freshness.py::TestConfigConstants::test_spot_change_threshold_exists PASSED [ 62%]
+tests/test_combined_models.py::test_risk_neutral_model PASSED            [ 63%]
+tests/test_combined_models.py::test_real_world_model PASSED              [ 65%]
+tests/test_jump_vectorized.py::test_vectorized_shape PASSED              [ 66%]
+tests/test_jump_vectorized.py::test_jump_count PASSED                    [ 68%]
+tests/test_jump_vectorized.py::test_jump_sizes PASSED                    [ 69%]
+tests/test_jump_vectorized.py::test_no_jumps_case PASSED                 [ 71%]
+tests/test_jump_vectorized.py::test_statistics_computation PASSED        [ 72%]
+tests/test_jump_vectorized.py::test_deterministic PASSED                 [ 74%]
+tests/test_signal_quality.py::TestConfidenceNotSaturated::test_moderate_edge_wide_spread PASSED [ 75%]
+tests/test_signal_quality.py::TestConfidenceNotSaturated::test_otm_strike_penalizes_confidence PASSED [ 77%]
+tests/test_signal_quality.py::TestConfidenceNotSaturated::test_spread_penalty_reduces_confidence PASSED [ 78%]
+tests/test_signal_quality.py::TestJumpIntensityCap::test_cap_enforced PASSED [ 80%]
+tests/test_signal_quality.py::TestJumpIntensityCap::test_shrinkage_applied PASSED [ 81%]
+tests/test_signal_quality.py::TestOTMEdgeScaling::test_otm_requires_higher_edge PASSED [ 83%]
+tests/test_signal_quality.py::TestOTMEdgeScaling::test_otm_conf_decay_is_exponential PASSED [ 84%]
+tests/test_signal_quality.py::TestBernoulliGuard::test_high_lambda_large_dt_triggers_guard PASSED [ 86%]
+tests/test_signal_quality.py::TestBernoulliGuard::test_moderate_lambda_passes PASSED [ 87%]
+tests/test_signal_quality.py::TestBernoulliGuard::test_0dte_with_capped_lambda_passes PASSED [ 89%]
+tests/test_signal_quality.py::TestBernoulliGuard::test_bernoulli_violated_flag_set_correctly PASSED [ 90%]
+tests/test_signal_quality.py::TestSellSignalPossible::test_sell_when_model_below_bid PASSED [ 92%]
+tests/test_signal_quality.py::TestConfigSanity::test_lambda_cap_is_reasonable PASSED [ 93%]
+tests/test_signal_quality.py::TestConfigSanity::test_lambda_prior_is_conservative PASSED [ 95%]
+tests/test_signal_quality.py::TestConfigSanity::test_shrinkage_alpha_is_small PASSED [ 96%]
+tests/test_signal_quality.py::TestConfigSanity::test_otm_edge_scale_positive PASSED [ 98%]
+tests/test_signal_quality.py::TestConfigSanity::test_otm_conf_decay_positive PASSED [100%]
+
+============================== warnings summary ===============================
+tests/test_spot_freshness.py::TestFreshnessGate::test_fresh_spot_allows_signal
+tests/test_spot_freshness.py::TestCacheInvalidation::test_cache_reused_when_spot_stable
+tests/test_spot_freshness.py::TestCacheInvalidation::test_cache_invalidated_on_big_spot_move
+tests/test_spot_freshness.py::TestCacheInvalidation::test_cache_kept_on_small_spot_move
+tests/test_signal_quality.py::TestConfidenceNotSaturated::test_moderate_edge_wide_spread
+tests/test_signal_quality.py::TestConfidenceNotSaturated::test_otm_strike_penalizes_confidence
+tests/test_signal_quality.py::TestConfidenceNotSaturated::test_spread_penalty_reduces_confidence
+tests/test_signal_quality.py::TestSellSignalPossible::test_sell_when_model_below_bid
+  C:\Users\henry\OneDrive\Desktop\PYTHON projects\0dte\core\random_numbers.py:18: UserWarning: The balance properties of Sobol' points require n to be a power of 2.
+    uniform_samples = sampler.random(n=n_paths)
+
+tests/test_combined_models.py::test_risk_neutral_model
+  C:\Users\henry\AppData\Local\Programs\Python\Python313\Lib\site-packages\_pytest\python.py:170: PytestReturnNotNoneWarning: Test functions should return None, but tests/test_combined_models.py::test_risk_neutral_model returned <class 'bool'>.
+  Did you mean to use `assert` instead of `return`?
+  See https://docs.pytest.org/en/stable/how-to/assert.html#return-not-none for more information.
+    warnings.warn(
+
+tests/test_combined_models.py::test_real_world_model
+  C:\Users\henry\AppData\Local\Programs\Python\Python313\Lib\site-packages\_pytest\python.py:170: PytestReturnNotNoneWarning: Test functions should return None, but tests/test_combined_models.py::test_real_world_model returned <class 'bool'>.
+  Did you mean to use `assert` instead of `return`?
+  See https://docs.pytest.org/en/stable/how-to/assert.html#return-not-none for more information.
+    warnings.warn(
+
+tests/test_jump_vectorized.py::test_vectorized_shape
+  C:\Users\henry\AppData\Local\Programs\Python\Python313\Lib\site-packages\_pytest\python.py:170: PytestReturnNotNoneWarning: Test functions should return None, but tests/test_jump_vectorized.py::test_vectorized_shape returned <class 'bool'>.
+  Did you mean to use `assert` instead of `return`?
+  See https://docs.pytest.org/en/stable/how-to/assert.html#return-not-none for more information.
+    warnings.warn(
+
+tests/test_jump_vectorized.py::test_jump_count
+  C:\Users\henry\AppData\Local\Programs\Python\Python313\Lib\site-packages\_pytest\python.py:170: PytestReturnNotNoneWarning: Test functions should return None, but tests/test_jump_vectorized.py::test_jump_count returned <class 'bool'>.
+  Did you mean to use `assert` instead of `return`?
+  See https://docs.pytest.org/en/stable/how-to/assert.html#return-not-none for more information.
+    warnings.warn(
+
+tests/test_jump_vectorized.py::test_jump_sizes
+  C:\Users\henry\AppData\Local\Programs\Python\Python313\Lib\site-packages\_pytest\python.py:170: PytestReturnNotNoneWarning: Test functions should return None, but tests/test_jump_vectorized.py::test_jump_sizes returned <class 'bool'>.
+  Did you mean to use `assert` instead of `return`?
+  See https://docs.pytest.org/en/stable/how-to/assert.html#return-not-none for more information.
+    warnings.warn(
+
+tests/test_jump_vectorized.py::test_no_jumps_case
+  C:\Users\henry\AppData\Local\Programs\Python\Python313\Lib\site-packages\_pytest\python.py:170: PytestReturnNotNoneWarning: Test functions should return None, but tests/test_jump_vectorized.py::test_no_jumps_case returned <class 'numpy.bool'>.
+  Did you mean to use `assert` instead of `return`?
+  See https://docs.pytest.org/en/stable/how-to/assert.html#return-not-none for more information.
+    warnings.warn(
+
+tests/test_jump_vectorized.py::test_statistics_computation
+  C:\Users\henry\AppData\Local\Programs\Python\Python313\Lib\site-packages\_pytest\python.py:170: PytestReturnNotNoneWarning: Test functions should return None, but tests/test_jump_vectorized.py::test_statistics_computation returned <class 'bool'>.
+  Did you mean to use `assert` instead of `return`?
+  See https://docs.pytest.org/en/stable/how-to/assert.html#return-not-none for more information.
+    warnings.warn(
+
+tests/test_jump_vectorized.py::test_deterministic
+  C:\Users\henry\AppData\Local\Programs\Python\Python313\Lib\site-packages\_pytest\python.py:170: PytestReturnNotNoneWarning: Test functions should return None, but tests/test_jump_vectorized.py::test_deterministic returned <class 'bool'>.
+  Did you mean to use `assert` instead of `return`?
+  See https://docs.pytest.org/en/stable/how-to/assert.html#return-not-none for more information.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+====================== 66 passed, 16 warnings in 34.05s =======================

@@ -3,7 +3,8 @@ from scipy.optimize import minimize
 from scipy.stats import norm
 import warnings
 
-from config import JUMP_THRESHOLD, TRADING_DAYS_PER_YEAR
+from config import (JUMP_THRESHOLD, TRADING_DAYS_PER_YEAR,
+                    MAX_LAMBDA_JUMP, LAMBDA_PRIOR, LAMBDA_SHRINKAGE_ALPHA)
 
 
 def calibrate_jumps_live(ticker='SPY', lookback_days=60):
@@ -98,18 +99,28 @@ def calibrate_from_returns(returns, dt=1/252, threshold=JUMP_THRESHOLD,
     # [1] Estimate jump intensity (λ)
     # λ = (# jumps) / (total time in years)
     total_time_years = n_periods * dt
-    lambda_jump = n_jumps / total_time_years
-    
+    lambda_raw = n_jumps / total_time_years
+
+    # [1b] Two-step intensity control
+    # Step 1: Hard safety cap
+    lambda_capped = min(lambda_raw, MAX_LAMBDA_JUMP)
+    if lambda_capped < lambda_raw:
+        print(f"  ⚠ λ_raw={lambda_raw:.1f}/yr exceeds cap → clamped to {lambda_capped:.1f}")
+
+    # Step 2: Shrinkage toward conservative prior
+    #   λ_eff = α·λ_capped + (1-α)·λ_prior
+    lambda_jump = (LAMBDA_SHRINKAGE_ALPHA * lambda_capped
+                   + (1 - LAMBDA_SHRINKAGE_ALPHA) * LAMBDA_PRIOR)
+    if abs(lambda_jump - lambda_raw) > 0.1:
+        print(f"  ⚠ λ shrinkage: raw={lambda_raw:.1f} → eff={lambda_jump:.1f} "
+              f"(α={LAMBDA_SHRINKAGE_ALPHA}, prior={LAMBDA_PRIOR})")
+
     # [2] Estimate jump size distribution (μⱼ, σⱼ)
     mu_jump = np.mean(jump_returns)
     sigma_jump = np.std(jump_returns, ddof=1)
-    
+
     # [3] Compute jump probability per period
     jump_prob_per_period = n_jumps / n_periods
-    
-    # Validation
-    if lambda_jump > 100:
-        warnings.warn(f"Very high jump intensity ({lambda_jump:.1f}/year). Check threshold.")
     
     if sigma_jump < 0.005:
         warnings.warn(f"Very low jump volatility ({sigma_jump:.4f}). May need more data.")

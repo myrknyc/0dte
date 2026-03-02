@@ -13,7 +13,7 @@ from typing import Optional, List, Dict, Any
 
 
 # Current schema version — bump this and add a migration when changing tables
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class SignalLogger:
@@ -81,7 +81,9 @@ class SignalLogger:
                 vr_factor       REAL,
                 reason          TEXT,
                 source          TEXT,
-                market_iv       REAL
+                market_iv       REAL,
+                spot_timestamp  TEXT,
+                spot_age_seconds REAL
             );
 
             CREATE INDEX IF NOT EXISTS idx_signals_lookup
@@ -113,6 +115,17 @@ class SignalLogger:
         if from_version < 2:
             self.conn.execute("ALTER TABLE signals ADD COLUMN market_iv REAL")
             from_version = 2
+        if from_version < 3:
+            # Add spot freshness columns
+            try:
+                self.conn.execute("ALTER TABLE signals ADD COLUMN spot_timestamp TEXT")
+            except Exception:
+                pass  # column may already exist
+            try:
+                self.conn.execute("ALTER TABLE signals ADD COLUMN spot_age_seconds REAL")
+            except Exception:
+                pass
+            from_version = 3
         self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.conn.commit()
 
@@ -143,12 +156,23 @@ class SignalLogger:
         source: str = "",
         minutes_to_expiry: int = None,
         market_iv: float = None,
+        spot_timestamp=None,
+        spot_age_seconds: float = None,
     ) -> int:
         """Insert a signal row and return its id."""
         # Auto-compute minutes if not provided
         if minutes_to_expiry is None and time_to_expiry is not None:
             # T is in trading years; 1 year = 252 days × 390 min
             minutes_to_expiry = int(round(time_to_expiry * 252 * 390))
+
+        # Serialize spot_timestamp to ISO string if it's a datetime
+        spot_ts_str = None
+        if spot_timestamp is not None:
+            spot_ts_str = (
+                spot_timestamp.isoformat()
+                if hasattr(spot_timestamp, 'isoformat')
+                else str(spot_timestamp)
+            )
 
         cur = self.conn.execute(
             """
@@ -157,8 +181,9 @@ class SignalLogger:
                 action, edge, confidence, model_price,
                 market_bid, market_ask, market_mid, spread, std_error,
                 spot_price, time_to_expiry, minutes_to_expiry, iv,
-                n_paths, vr_factor, reason, source, market_iv
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                n_paths, vr_factor, reason, source, market_iv,
+                spot_timestamp, spot_age_seconds
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 self.session_id,
@@ -184,6 +209,8 @@ class SignalLogger:
                 reason,
                 source,
                 market_iv,
+                spot_ts_str,
+                spot_age_seconds,
             ),
         )
         self.conn.commit()

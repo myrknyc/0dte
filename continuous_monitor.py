@@ -6,15 +6,18 @@ import threading
 
 from data.data_provider import MarketDataProvider, select_provider, IBKRProvider
 from trading.trading_system import TradingSystem
+from trading.paper_trader import PaperTrader
+from trading.paper_journal import PaperJournal, now_et
+from trading.eod_reporter import EODReporter
 from signals.signal_logger import SignalLogger
 from calibration.heston_calibrator import calibrate_heston_live
 from calibration.jump_calibrator import calibrate_jumps_live
-from config import get_time_to_expiry
+from config import get_time_to_expiry, SPOT_MAX_AGE_SECONDS
 
 
 class ContinuousTradingMonitor:
     def __init__(self, ticker='SPY', recalibrate_minutes=30, edge_threshold=0.02,
-                 provider: MarketDataProvider = None):
+                 provider: MarketDataProvider = None, enable_paper_trading=False):
         self.ticker = ticker
         self.recalibrate_minutes = recalibrate_minutes
         self.edge_threshold = edge_threshold
@@ -25,6 +28,14 @@ class ContinuousTradingMonitor:
         # Initialize components
         self.trader = TradingSystem(ticker, provider=self.provider)
         self.logger = SignalLogger()
+        
+        # Paper trading (optional)
+        self.paper_trader = None
+        self._eod_reporter = None
+        if enable_paper_trading:
+            journal = PaperJournal()
+            self.paper_trader = PaperTrader(journal=journal)
+            self._eod_reporter = EODReporter(journal=journal)
         
         # For IBKR: keep reference to the streaming feed for live updates
         self._ibkr_feed = None
@@ -55,9 +66,11 @@ class ContinuousTradingMonitor:
     
     def _on_price_update(self, symbol, data):
         self.current_price = data['last']
+        self._price_timestamp = datetime.now()
         
-        # Update trader's current price
+        # Update trader's current price + timestamp
         self.trader.S0 = self.current_price
+        self.trader.spot_timestamp = self._price_timestamp
         
         # Check if recalibration needed
         if self.last_calibration:
@@ -93,6 +106,7 @@ class ContinuousTradingMonitor:
                 return
             
             signals_found = []
+            all_signals = []    # every signal, for paper trader
             T = get_time_to_expiry()
             
             for strike in strikes:
@@ -118,6 +132,7 @@ class ContinuousTradingMonitor:
                     )
                     
                     # Log every signal
+                    spot_age = signal.get('spot_age_seconds', None)
                     self.logger.log_signal(
                         ticker=self.ticker,
                         strike=strike,
@@ -139,6 +154,8 @@ class ContinuousTradingMonitor:
                         reason=signal['reason'],
                         source='continuous_monitor',
                         market_iv=mkt_iv,
+                        spot_timestamp=self.trader.spot_timestamp,
+                        spot_age_seconds=spot_age,
                     )
                     
                     if signal['action'] != 'HOLD' and signal['confidence'] > 0.6:
@@ -147,6 +164,7 @@ class ContinuousTradingMonitor:
                             'type': 'CALL',
                             **signal
                         })
+                    all_signals.append(signal)
             
             # Display strong signals
             if signals_found:
@@ -159,6 +177,27 @@ class ContinuousTradingMonitor:
                 print()
             
             self.latest_signals = signals_found
+            
+            # ── Paper trading hook ──
+            if self.paper_trader and all_signals:
+                quote_map = {}
+                for strike in strikes:
+                    chain_row = calls[calls['strike'] == strike]
+                    if len(chain_row) == 0:
+                        continue
+                    r = chain_row.iloc[0]
+                    b_col = 'bid' if 'bid' in r.index else 'call_bid'
+                    a_col = 'ask' if 'ask' in r.index else 'call_ask'
+                    if r[b_col] > 0 and r[a_col] > 0:
+                        quote_map[strike] = {
+                            'bid': float(r[b_col]),
+                            'ask': float(r[a_col]),
+                            'spot': self.current_price,
+                            'spot_age': (datetime.now() - self.trader.spot_timestamp).total_seconds() if getattr(self.trader, 'spot_timestamp', None) else 0,
+                        }
+                self.paper_trader.on_scan(
+                    all_signals, quote_map, self.current_price, now_et()
+                )
             
         except Exception as e:
             print(f"Error scanning strikes: {e}")
@@ -210,8 +249,8 @@ class ContinuousTradingMonitor:
                     # For yfinance: refresh spot price each cycle
                     if not self._ibkr_feed:
                         try:
-                            self.current_price = self.provider.get_spot_price(self.ticker)
-                            self.trader.S0 = self.current_price
+                            self.trader.update_spot()
+                            self.current_price = self.trader.S0
                         except Exception:
                             pass
                     self.scan_strikes()
@@ -234,6 +273,9 @@ class ContinuousTradingMonitor:
         self.logger.close()
         if self._ibkr_feed:
             self._ibkr_feed.disconnect()
+        # Paper trading EOD report
+        if self.paper_trader and self._eod_reporter:
+            self._eod_reporter.full_report(self.paper_trader.run_id)
         print("Monitor stopped")
 
 
@@ -255,7 +297,8 @@ if __name__ == "__main__":
         ticker='SPY',
         recalibrate_minutes=30,
         edge_threshold=0.02,
-        provider=provider
+        provider=provider,
+        enable_paper_trading=True
     )
     
     # Connect and start

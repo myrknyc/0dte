@@ -49,7 +49,13 @@ TRADING_THRESHOLDS = {
     'max_spread_pct': 0.10,     # Maximum spread as % of mid
     'bs_divergence_cap': 0.50,  # Cap confidence if model diverges > 50% from BS
     'bs_divergence_conf': 0.30, # Confidence cap value when BS divergence triggers
+    'otm_edge_scale': 0.01,     # Extra min_edge required per $ OTM
+    'otm_conf_decay': 0.15,     # Confidence exponential decay rate per $ OTM
 }
+
+# --- Spot freshness / cache invalidation ---
+SPOT_MAX_AGE_SECONDS = 10       # Suppress signals if spot older than this
+SPOT_CHANGE_THRESHOLD = 0.001   # Invalidate path cache on 0.1% spot move
 
 # --- Risk manager defaults ---
 RISK_DEFAULTS = {
@@ -69,6 +75,11 @@ HESTON_BOUNDS = [
 ]
 
 JUMP_THRESHOLD = 3.0
+
+# --- Jump intensity control ---
+MAX_LAMBDA_JUMP = 200.0         # Hard safety cap (annualized)
+LAMBDA_PRIOR = 5.0              # Conservative prior (jumps/year)
+LAMBDA_SHRINKAGE_ALPHA = 0.15   # Shrinkage weight: λ_eff = α·λ_calib + (1-α)·λ_prior
 
 YF_PERIOD = "5d"          
 YF_INTERVAL = "1m" 

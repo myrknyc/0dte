@@ -66,6 +66,7 @@ def main():
     
     print(f"✓ Model calibrated")
     print(f"  SPY: ${trader.S0:.2f}")
+    print(f"  Spot timestamp: {trader.spot_timestamp}")
     print(f"  VWAP: ${trader.vwap:.2f}")
     print(f"  v0 (inst. vol): {np.sqrt(trader.v0):.2%}")
     
@@ -125,10 +126,14 @@ def main():
             mkt_iv = call_data['impliedVolatility'].values[0] if 'impliedVolatility' in call_data.columns else None
             
             if bid > 0 and ask > 0:  # Valid market
+                # Refresh spot before each strike scan
+                trader.update_spot()
+                
                 signal = trader.get_trading_signal(strike, bid, ask, 'call',
                                                    market_iv=mkt_iv)
                 
                 # Log every signal (including HOLD) for backtesting
+                spot_age = signal.get('spot_age_seconds', None)
                 logger.log_signal(
                     ticker='SPY',
                     strike=strike,
@@ -150,6 +155,8 @@ def main():
                     reason=signal['reason'],
                     source='signal_generator',
                     market_iv=mkt_iv,
+                    spot_timestamp=trader.spot_timestamp,
+                    spot_age_seconds=spot_age,
                 )
                 logged_count += 1
                 

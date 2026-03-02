@@ -13,6 +13,7 @@ signal_generator work identically regardless of data source.
 import numpy as np
 import pandas as pd
 from abc import ABC, abstractmethod
+from datetime import datetime
 from typing import Dict, Any, Optional
 
 
@@ -25,8 +26,16 @@ class MarketDataProvider(ABC):
     name: str = "base"
 
     @abstractmethod
-    def get_spot_price(self, ticker: str) -> float:
-        """Return latest spot price."""
+    def get_spot_price(self, ticker: str) -> Dict[str, Any]:
+        """Return latest spot price with freshness metadata.
+
+        Returns
+        -------
+        dict  with keys:
+            price : float         — last traded / quoted price
+            timestamp : datetime  — when this price was observed
+            age_seconds : float   — seconds since observation
+        """
 
     @abstractmethod
     def get_intraday_data(self, ticker: str, period: str = '5d',
@@ -81,15 +90,18 @@ class YFinanceProvider(MarketDataProvider):
             self._tickers[ticker] = self._yf.Ticker(ticker)
         return self._tickers[ticker]
 
-    def get_spot_price(self, ticker: str) -> float:
-        t = self._get_ticker(ticker)
+    def get_spot_price(self, ticker: str) -> Dict[str, Any]:
+        # Create a FRESH Ticker every time to avoid stale cache
+        t = self._yf.Ticker(ticker)
+        fetch_time = datetime.now()
         try:
             price = t.fast_info['lastPrice']
         except Exception:
             hist = t.history(period='1d', interval='1m')
             price = hist['Close'].iloc[-1]
-        print(f"  {ticker} spot: ${price:.2f}  (yfinance)")
-        return float(price)
+        age = (datetime.now() - fetch_time).total_seconds()
+        print(f"  {ticker} spot: ${price:.2f}  (yfinance, age={age:.1f}s)")
+        return {'price': float(price), 'timestamp': fetch_time, 'age_seconds': age}
 
     def get_intraday_data(self, ticker: str, period: str = '5d',
                           interval: str = '1m') -> pd.DataFrame:
@@ -144,17 +156,19 @@ class IBKRProvider(MarketDataProvider):
                 )
             self._connected = True
 
-    def get_spot_price(self, ticker: str) -> float:
+    def get_spot_price(self, ticker: str) -> Dict[str, Any]:
         self._ensure_connected()
         self.feed.subscribe_stock(ticker)
         # Wait briefly for first tick
         import time as _t
         _t.sleep(1.5)
+        fetch_time = datetime.now()
         price = self.feed.get_current_price(ticker)
         if price is None:
             raise ValueError(f"No price received for {ticker} from IBKR")
-        print(f"  {ticker} spot: ${price:.2f}  (IBKR live)")
-        return float(price)
+        age = (datetime.now() - fetch_time).total_seconds()
+        print(f"  {ticker} spot: ${price:.2f}  (IBKR live, age={age:.1f}s)")
+        return {'price': float(price), 'timestamp': fetch_time, 'age_seconds': age}
 
     def get_intraday_data(self, ticker: str, period: str = '5d',
                           interval: str = '1m') -> pd.DataFrame:
@@ -212,7 +226,7 @@ class OtherProvider(MarketDataProvider):
 
     name = "other"
 
-    def get_spot_price(self, ticker: str) -> float:
+    def get_spot_price(self, ticker: str) -> Dict[str, Any]:
         raise NotImplementedError(
             "Other provider not configured. Subclass OtherProvider and "
             "implement get_spot_price / get_intraday_data / get_option_chain."

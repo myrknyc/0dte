@@ -4,7 +4,7 @@ from datetime import datetime
 from config import (
     DEFAULT_PARAMS, RISK_FREE_RATE, N_PATHS_DEFAULT, N_STEPS_0DTE,
     TRADING_DAYS_PER_YEAR, get_time_to_expiry, USE_ANTITHETIC,
-    TRADING_THRESHOLDS
+    TRADING_THRESHOLDS, SPOT_MAX_AGE_SECONDS, SPOT_CHANGE_THRESHOLD
 )
 from data.data_provider import MarketDataProvider, get_provider
 from pricing.black_scholes import black_scholes
@@ -12,6 +12,7 @@ from pricing.black_scholes import black_scholes
 from core.time_grid import generate_time_grid
 from core.random_numbers import generate_correlated_normals
 from models.combined_model import simulate_combined_paths_fast as simulate_combined_paths
+from models.jump_diffusion import validate_bernoulli_approximation
 from pricing.european import price_european_option
 from calibration.heston_calibrator import calibrate_to_realized_vol
 from calibration.jump_calibrator import calibrate_from_returns
@@ -25,6 +26,7 @@ class TradingSystem:
         
         # Market state
         self.S0 = None
+        self.spot_timestamp = None   # when S0 was last observed
         self.vwap = None
         self.historical_vol = None
         
@@ -39,6 +41,7 @@ class TradingSystem:
         # Cache for efficiency
         self._cached_paths = None
         self._cached_T = None
+        self._cached_S0 = None  # spot used to build cached paths
         
     def calibrate_to_market(self, verbose=True):
         if verbose:
@@ -47,7 +50,9 @@ class TradingSystem:
             print(f"{'='*60}")
         
         # 1. Get current spot price
-        self.S0 = self.provider.get_spot_price(self.ticker)
+        spot_data = self.provider.get_spot_price(self.ticker)
+        self.S0 = spot_data['price']
+        self.spot_timestamp = spot_data['timestamp']
         
         # 2. Get intraday data for calibration
         from config import YF_PERIOD, YF_INTERVAL
@@ -150,7 +155,18 @@ class TradingSystem:
         
         # Check cache
         if self._cached_paths is not None and self._cached_T == T_bucket:
-            return self._cached_paths
+            # Invalidate cache if spot has moved meaningfully
+            if self._cached_S0 is not None:
+                spot_pct_change = abs(self.S0 - self._cached_S0) / self._cached_S0
+                if spot_pct_change > SPOT_CHANGE_THRESHOLD:
+                    if hasattr(self, '_verbose_cache') and self._verbose_cache:
+                        print(f"  [CACHE] Spot moved {spot_pct_change:.4%} "
+                              f"({self._cached_S0:.2f}→{self.S0:.2f}), invalidating")
+                    self._cached_paths = None
+                else:
+                    return self._cached_paths
+            else:
+                return self._cached_paths
         
         # Generate time grid
         times, dt_array = generate_time_grid(T_bucket, self.n_steps)
@@ -170,6 +186,23 @@ class TradingSystem:
             )
         
         # Simulate paths
+        use_jumps = True
+        bernoulli_violated = False
+
+        # Bernoulli guard: check if approximation holds at this λ and dt
+        lambda_jump = self.params.get('lambda_jump', 0)
+        if lambda_jump > 0 and len(dt_array) > 0:
+            dt_max = float(np.max(dt_array))
+            valid, prob_multi = validate_bernoulli_approximation(
+                lambda_jump, dt_max, threshold=0.01
+            )
+            if not valid:
+                print(f"  ⚠ Bernoulli approx FAILED: λ={lambda_jump:.1f}, "
+                      f"dt_max={dt_max:.6f}, P(≥2 jumps/step)={prob_multi:.4f}")
+                print(f"  → Disabling jump component for this simulation")
+                use_jumps = False
+                bernoulli_violated = True
+
         S_paths, V_paths = simulate_combined_paths(
             S0=self.S0,
             v0=self.v0,
@@ -178,7 +211,7 @@ class TradingSystem:
             dt_array=dt_array,
             Z1=Z1,
             Z2=Z2,
-            use_jumps=True,
+            use_jumps=use_jumps,
             use_mean_reversion=False  # Risk-neutral: no mean reversion
         )
         
@@ -190,9 +223,11 @@ class TradingSystem:
             'dt_array': dt_array,
             'Z1': Z1,
             'Z2': Z2,
-            'T_used': T_bucket
+            'T_used': T_bucket,
+            'bernoulli_violated': bernoulli_violated,
         }
         self._cached_T = T_bucket
+        self._cached_S0 = self.S0  # remember which spot generated these paths
         
         return self._cached_paths
     
@@ -293,10 +328,47 @@ class TradingSystem:
                   f"Clamping.")
             result['price'] = upper_bound
         
+        # Propagate Bernoulli violation flag for confidence penalty
+        result['bernoulli_violated'] = paths_data.get('bernoulli_violated', False)
+        
         return result
     
     def get_trading_signal(self, strike, market_bid, market_ask, option_type='call',
                            market_iv=None):
+        # ── Spot freshness gate ──────────────────────────────────
+        from datetime import datetime as _dt
+        if self.spot_timestamp is not None:
+            spot_age = (_dt.now() - self.spot_timestamp).total_seconds()
+        else:
+            spot_age = float('inf')  # unknown age → treat as stale
+
+        if spot_age > SPOT_MAX_AGE_SECONDS:
+            return {
+                'action': 'HOLD',
+                'edge': 0.0,
+                'confidence': 0.0,
+                'reason': f"Spot data stale ({spot_age:.0f}s old, max={SPOT_MAX_AGE_SECONDS}s)",
+                'model_price': 0.0,
+                'market_mid': (market_bid + market_ask) / 2,
+                'market_bid': market_bid,
+                'market_ask': market_ask,
+                'std_error': float('nan'),
+                'spread': market_ask - market_bid,
+                'spot_age_seconds': spot_age,
+                'strike': strike,
+                'option_type': option_type,
+                'ticker': self.ticker,
+                'required_edge': 0,
+                'market_iv': market_iv,
+                'lambda_jump': self.params.get('lambda_jump'),
+                'v0': self.v0,
+                'kappa': self.params.get('kappa'),
+                'theta_v': self.params.get('theta_v'),
+                'sigma_v': self.params.get('sigma_v'),
+                'rho': self.params.get('rho'),
+                'otm_dollars': 0.0,
+            }
+
         # Get model price (pass per-strike IV for better CV performance)
         result = self.price_option(strike, option_type=option_type, market_iv=market_iv)
         model_price = result['price']
@@ -317,8 +389,23 @@ class TradingSystem:
                 'reason': f"Spread too wide (${spread:.2f}) - Illiquid/After-hours",
                 'model_price': model_price,
                 'market_mid': market_mid,
+                'market_bid': market_bid,
+                'market_ask': market_ask,
                 'std_error': std_error,
-                'spread': spread
+                'spread': spread,
+                'spot_age_seconds': spot_age,
+                'strike': strike,
+                'option_type': option_type,
+                'ticker': self.ticker,
+                'required_edge': 0,
+                'market_iv': market_iv,
+                'lambda_jump': self.params.get('lambda_jump'),
+                'v0': self.v0,
+                'kappa': self.params.get('kappa'),
+                'theta_v': self.params.get('theta_v'),
+                'sigma_v': self.params.get('sigma_v'),
+                'rho': self.params.get('rho'),
+                'otm_dollars': 0.0,
             }
 
         # 2. CALCULATE EDGE ON EXECUTION PRICE
@@ -346,34 +433,66 @@ class TradingSystem:
             action_candidate = 'HOLD'
             execution_price = market_mid
 
-        # 3. CONFIDENCE SCORING
+        # 3. CONFIDENCE SCORING (multiplicative penalties)
         if abs(edge) > 0:
-            # Signal-to-noise ratio: Edge $ / Model Error $
+            # ── Base confidence: MC precision ──
             edge_dollars = abs(model_price - execution_price)
             if np.isfinite(std_error) and std_error > 1e-6:
                 snr = edge_dollars / std_error
             else:
-                # NaN or near-zero stderr = unreliable model → low confidence
                 snr = 0.0
-            confidence = min(1.0, snr / 3.0)
-            
-            # Cap confidence if model is inconsistent with BS sanity
+            sim_confidence = min(1.0, snr / 3.0)
+
+            # ── Base confidence: edge magnitude ──
+            # Tiny edge → low confidence even if SNR is huge
+            edge_confidence = min(1.0, abs(edge) / 0.10)
+
+            # Base = min of simulation and edge magnitude
+            confidence = min(sim_confidence, edge_confidence)
+
+            # ── Multiplicative penalty: spread ──
+            # Wider spread → less certainty about fair value
+            spread_penalty = max(0.1, 1.0 - spread / max(market_mid, 0.01))
+            confidence *= spread_penalty
+
+            # ── Multiplicative penalty: OTM distance ──
+            import math
+            if option_type == 'call':
+                otm_dollars = max(0.0, strike - self.S0)
+            else:
+                otm_dollars = max(0.0, self.S0 - strike)
+            otm_conf_decay = TRADING_THRESHOLDS['otm_conf_decay']
+            otm_penalty = math.exp(-otm_conf_decay * otm_dollars)
+            confidence *= otm_penalty
+
+            # ── Multiplicative penalty: BS divergence ──
             r_bs = self.params.get('r', RISK_FREE_RATE)
             bs_check = black_scholes(self.S0, strike, get_time_to_expiry(), 
                                      r_bs, np.sqrt(self.v0), option_type)
             bs_div_cap = TRADING_THRESHOLDS['bs_divergence_cap']
             bs_div_conf = TRADING_THRESHOLDS['bs_divergence_conf']
             if bs_check > 0 and abs(model_price - bs_check) / bs_check > bs_div_cap:
-                confidence = min(confidence, bs_div_conf)
+                confidence *= bs_div_conf
+
+            # ── Multiplicative penalty: Bernoulli violation ──
+            if result.get('bernoulli_violated', False):
+                confidence *= 0.3
         else:
             confidence = 0.0
+            otm_dollars = 0.0
         
-        # 4. TRADING THRESHOLDS  (from config)
+        # 4. TRADING THRESHOLDS  (from config, with OTM scaling)
         min_edge = TRADING_THRESHOLDS['min_edge']
+        otm_edge_scale = TRADING_THRESHOLDS['otm_edge_scale']
+        if option_type == 'call':
+            otm_dollars_for_edge = max(0.0, strike - self.S0)
+        else:
+            otm_dollars_for_edge = max(0.0, self.S0 - strike)
+        required_edge = min_edge + otm_edge_scale * otm_dollars_for_edge
         min_confidence = TRADING_THRESHOLDS['min_confidence']
         
 
-        if action_candidate != 'HOLD' and edge > min_edge and confidence >= min_confidence:
+        if action_candidate != 'HOLD' and edge > required_edge and confidence >= min_confidence:
             action = action_candidate
             if action == 'BUY':
                 reason = f"Model ${model_price:.2f} > Ask ${market_ask:.2f} ({edge*100:.1f}% edge)"
@@ -390,12 +509,44 @@ class TradingSystem:
             'reason': reason,
             'model_price': model_price,
             'market_mid': market_mid,
+            'market_bid': market_bid,
+            'market_ask': market_ask,
             'std_error': std_error,
             'spread': spread,
             'n_paths': result.get('n_paths'),
             'variance_reduction_factor': result.get('variance_reduction_factor'),
             'beta': result.get('beta'),
+            'spot_age_seconds': spot_age,
+            'bernoulli_violated': result.get('bernoulli_violated', False),
+            'strike': strike,
+            'option_type': option_type,
+            'ticker': self.ticker,
+            'required_edge': required_edge,
+            'market_iv': market_iv,
+            'lambda_jump': self.params.get('lambda_jump'),
+            'v0': self.v0,
+            'kappa': self.params.get('kappa'),
+            'theta_v': self.params.get('theta_v'),
+            'sigma_v': self.params.get('sigma_v'),
+            'rho': self.params.get('rho'),
+            'calibration_flags': result.get('calibration_flags'),
+            'otm_dollars': otm_dollars,
         }
+
+    def update_spot(self):
+        """Fetch fresh spot, update S0 + timestamp, conditionally invalidate cache."""
+        spot_data = self.provider.get_spot_price(self.ticker)
+        new_price = spot_data['price']
+
+        # Check if cache needs invalidation
+        if self.S0 is not None and self.S0 > 0:
+            pct_change = abs(new_price - self.S0) / self.S0
+            if pct_change > SPOT_CHANGE_THRESHOLD:
+                self._cached_paths = None
+
+        self.S0 = new_price
+        self.spot_timestamp = spot_data['timestamp']
+        return spot_data
 
 
 # Example usage
