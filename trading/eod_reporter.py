@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 from trading.paper_journal import PaperJournal
 from trading.paper_config import PAPER_TRADING
+from trading.backtest_metrics import BacktestMetrics
 
 
 class EODReporter:
@@ -350,6 +351,74 @@ class EODReporter:
         print(f"✓ Exported {len(rows)} snapshots → {filepath}")
 
     # ================================================================== #
+    #  Backtest metrics                                                    #
+    # ================================================================== #
+
+    def print_backtest_metrics(self, run_id: str, track: str = None):
+        """Print all four backtest metrics for a track."""
+        m = BacktestMetrics(self.journal, run_id, track=track)
+        label = ('Track A' if track == 'decision_time'
+                 else 'Track B' if track == 'all_signals'
+                 else 'All Tracks')
+
+        # ── Per-Day Metrics ──
+        pd = m.per_day_metrics()
+        print(f"\n  {label} — Per-Day Metrics:")
+        print(f"    Median Per-Day Avg PnL/Trade : ${pd['median_daily_avg_pnl']:+.2f}")
+        print(f"    Median Daily Total PnL       : ${pd['median_daily_total_pnl']:+.2f}")
+        if pd['daily_series']:
+            print(f"    Days traded : {len(pd['daily_series'])}")
+            for day in pd['daily_series']:
+                print(f"      {day['date']}: {day['n_trades']} trades, "
+                      f"total=${day['total_pnl']:+.2f}, "
+                      f"avg=${day['avg_pnl']:+.2f}/trade")
+
+        # ── Drawdown ──
+        dd = m.drawdown()
+        tbt = dd['trade_by_trade']
+        dly = dd['daily']
+        print(f"\n  {label} — Drawdown:")
+        print(f"    Trade-by-trade max DD : ${tbt['max_dd_dollars']:.2f} "
+              f"({tbt['max_dd_pct']:.1f}%)")
+        print(f"    Daily max DD         : ${dly['max_dd_dollars']:.2f} "
+              f"({dly['max_dd_pct']:.1f}%)")
+
+        # ── Tail-Loss ──
+        tl = m.tail_loss()
+        print(f"\n  {label} — Tail-Loss Analysis:")
+        print(f"    Avg loss (abs)       : ${tl['avg_loss_abs']:.2f}")
+        print(f"    Bad threshold (2×)   : ${tl['bad_threshold']:.2f}")
+        print(f"    Bad tails            : {tl['bad_count']} "
+              f"({tl['bad_pct']:.1f}% of trades)")
+        print(f"    Extreme tails (3×)   : {tl['extreme_count']} "
+              f"({tl['extreme_pct']:.1f}% of trades)")
+        if tl['bad_count'] > 0:
+            print(f"    Avg bad tail size    : ${tl['avg_bad_tail_magnitude']:.2f}")
+            print(f"    Tail % of losses     : {tl['tail_pct_of_total_losses']:.1f}%")
+            print(f"    Tail % of net PnL    : {tl['tail_pct_of_net_pnl']:+.1f}%")
+
+        # ── Regime Stability ──
+        rs = m.regime_stability()
+        if rs:
+            print(f"\n  {label} — PF/Accuracy by Regime:")
+            print(f"    {'Regime':<10} {'Trades':>6} {'WR':>6} "
+                  f"{'PF':>8} {'E[PnL]':>9} {'Total PnL':>10}")
+            for regime in ['calm', 'normal', 'volatile', 'extreme', 'unknown']:
+                if regime not in rs:
+                    continue
+                r = rs[regime]
+                pf_str = (f"{r['profit_factor']:.2f}"
+                          if r['profit_factor'] != float('inf') else '∞')
+                warn = ' ⚠' if r['small_sample'] else ''
+                print(f"    {regime:<10} {r['n_trades']:>6} "
+                      f"{r['win_rate']:>5.1f}% {pf_str:>8} "
+                      f"${r['expectancy']:>+8.2f} "
+                      f"${r['total_pnl']:>+9.2f}{warn}")
+            # Note about small samples
+            if any(r['small_sample'] for r in rs.values()):
+                print(f"    ⚠ = fewer than 10 trades, interpret cautiously")
+
+    # ================================================================== #
     #  Full EOD report                                                     #
     # ================================================================== #
 
@@ -358,6 +427,14 @@ class EODReporter:
         """Print full EOD report and optionally export CSVs."""
         self.print_summary(run_id, date_str)
         self.print_forward_accuracy(run_id, date_str)
+
+        # Backtest metrics per track
+        tracks = self.cfg.get('tracks', ['decision_time', 'all_signals'])
+        print(f"\n{'─'*65}")
+        print(f"  📈 BACKTEST METRICS")
+        print(f"{'─'*65}")
+        for track in tracks:
+            self.print_backtest_metrics(run_id, track=track)
 
         if export_dir:
             os.makedirs(export_dir, exist_ok=True)

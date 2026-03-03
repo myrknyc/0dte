@@ -8,7 +8,7 @@ from models.mean_reversion import compute_mu_t, compute_mean_reversion_drift
 
 def simulate_combined_paths_fast(S0, v0, params, times, dt_array, Z1, Z2=None,
                                  use_jumps=True, use_mean_reversion=None, seed=None,
-                                 verbose=False):
+                                 verbose=False, diurnal_weights=None):
     if seed is not None:
         np.random.seed(seed)
     
@@ -81,6 +81,10 @@ def simulate_combined_paths_fast(S0, v0, params, times, dt_array, Z1, Z2=None,
         
         # Floor variance before use (prevent sqrt of negative)
         v_i = np.maximum(v_paths[:, i], MIN_VARIANCE)
+        
+        # Apply intraday volatility seasonality (U-shape scaling)
+        if diurnal_weights is not None:
+            v_i = v_i * diurnal_weights[i]
         
         # Drift (vectorized): risk-neutral with jump compensator
         drift = (r - 0.5 * v_i - jump_compensator) * dt

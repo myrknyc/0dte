@@ -153,6 +153,11 @@ def price_european_option(S_paths, K, T, r, option_type='call',
     if not np.isfinite(std_error):
         std_error = float('nan')
     
+    # CVaR₉₅ — average loss in worst 5% of outcomes (tail-risk measure)
+    sorted_payoffs = np.sort(payoffs_for_pricing)
+    n_tail = max(1, int(0.05 * n_paths))
+    cvar_95 = float(np.mean(sorted_payoffs[:n_tail]))
+    
     # 95% confidence interval
     ci_lower = price - 1.96 * std_error if np.isfinite(std_error) else float('nan')
     ci_upper = price + 1.96 * std_error if np.isfinite(std_error) else float('nan')
@@ -163,6 +168,7 @@ def price_european_option(S_paths, K, T, r, option_type='call',
     result = {
         'price': price,
         'std_error': std_error,
+        'cvar_95': cvar_95,
         'confidence_interval': (ci_lower, ci_upper),
         'n_paths': n_paths,
         'elapsed_time': elapsed_time,

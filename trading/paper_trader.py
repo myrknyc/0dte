@@ -95,6 +95,15 @@ class PaperTrader:
             self._enter_trade(sig, spot, ts_utc, track, decision_ts=ts_utc)
             n_entered += 1
 
+        # Console summary
+        time_str = ts_et.strftime('%H:%M')
+        print(f"\n  [Paper] Decision @ {time_str} ET: "
+              f"{len(signals)} signals -> {len(eligible)} eligible -> "
+              f"{n_entered} entered | {len(self._open_trades_a)} open")
+        if rejections:
+            rej_str = ', '.join(f'{k}:{v}' for k, v in sorted(rejections.items(), key=lambda x: -x[1]))
+            print(f"           Rejections: {rej_str}")
+
         # ── Snapshot ──
         self.journal.record_snapshot(
             run_id=self.run_id, track=track, timestamp_utc=ts_utc,
@@ -147,6 +156,12 @@ class PaperTrader:
             eod_h, eod_m = int(eod_str.split(':')[0]), int(eod_str.split(':')[1])
             # We can't precisely check TTE without the timestamp, so skip
             # this filter gracefully (it's enforced by the caller context)
+
+        # CVaR tail-risk filter
+        cvar = sig.get('cvar_95')
+        max_cvar_loss = f.get('max_cvar_loss')
+        if cvar is not None and max_cvar_loss is not None and cvar < max_cvar_loss:
+            return 'tail_risk_too_high'
 
         return None  # eligible
 
@@ -242,6 +257,7 @@ class PaperTrader:
             'trade_id': trade_id,
             'strike': sig.get('strike'),
             'action': action,
+            'option_type': sig.get('option_type', 'call'),
             'entry_timestamp_utc': ts_utc,
             'entry_fill': fill,
             'quantity': qty,
@@ -250,6 +266,12 @@ class PaperTrader:
         }
         if track == 'decision_time':
             self._open_trades_a[trade_id] = trade
+            print(f"\n  >>> PAPER TRADE ENTERED [Track A] <<<")
+            print(f"      {action} {sig.get('strike')} @ mid=${fill['mid']:.4f}  "
+                  f"touch=${fill['touch']:.4f}  spread=${fill['spread']:.4f}")
+            print(f"      edge={sig.get('edge', 0)*100:.1f}%  "
+                  f"conf={sig.get('confidence', 0)*100:.0f}%  "
+                  f"OTM=${sig.get('otm_dollars', 0):.1f}")
         else:
             self._open_trades_b[trade_id] = trade
 
@@ -301,7 +323,8 @@ class PaperTrader:
 
                 if track == 'decision_time':
                     exit_reason = self._check_exit_a(
-                        trade, exit_bid, exit_ask, hold_minutes, quote_fresh
+                        trade, exit_bid, exit_ask, hold_minutes, quote_fresh,
+                        ts_et=ts_et, spot=spot_exit
                     )
                 else:
                     exit_reason = self._check_exit_b(trade, hold_minutes)
@@ -315,8 +338,9 @@ class PaperTrader:
                                   spot_exit, ts_utc, exit_reason, hold_minutes)
 
     def _check_exit_a(self, trade: dict, bid: float, ask: float,
-                      hold_minutes: float, quote_fresh: bool) -> Optional[str]:
-        """Track A exit: hybrid (TP/SL/time/EOD)."""
+                      hold_minutes: float, quote_fresh: bool,
+                      ts_et: datetime = None, spot: float = None) -> Optional[str]:
+        """Track A exit: hybrid (TP/SL/theta_decay/time/EOD)."""
         mode = self.cfg.get('exit_mode', 'hybrid')
         mid = (bid + ask) / 2.0
 
@@ -341,6 +365,41 @@ class PaperTrader:
                 return 'take_profit'
             if unrealized_pct <= -sl:
                 return 'stop_loss'
+
+        # ── Theta-decay-aware exit ──
+        greeks_cfg = self.cfg.get('greeks_exit', {})
+        if greeks_cfg.get('enabled', False) and ts_et is not None and spot is not None:
+            min_profit = greeks_cfg.get('min_profit_pct', 0.05)
+
+            if unrealized_pct > min_profit:
+                strike = trade['strike']
+                option_type = trade.get('option_type', 'call')
+
+                # Correct intrinsic value using spot vs strike
+                if option_type == 'call':
+                    intrinsic = max(0.0, spot - strike)
+                else:
+                    intrinsic = max(0.0, strike - spot)
+
+                # Time value = option mid − intrinsic (per contract)
+                time_value = max(0.0, mid - intrinsic)
+
+                # Minutes remaining until EOD
+                eod_str = self.cfg.get('eod_exit_time', '15:55')
+                eod_h, eod_m = int(eod_str.split(':')[0]), int(eod_str.split(':')[1])
+                eod_minutes = eod_h * 60 + eod_m
+                now_minutes = ts_et.hour * 60 + ts_et.minute
+                minutes_left = max(1, eod_minutes - now_minutes)
+
+                # Linear theta estimate: time_value decays to ~0 by close
+                theta_per_min = time_value / minutes_left
+                lookforward = greeks_cfg.get('lookforward_minutes', 15)
+                decay_threshold = greeks_cfg.get('theta_decay_pct', 0.80)
+
+                projected_decay = theta_per_min * lookforward
+
+                if time_value > 0 and projected_decay > decay_threshold * time_value:
+                    return 'theta_decay'
 
         # Time exit
         if mode in ('time', 'hybrid'):
@@ -419,6 +478,15 @@ class PaperTrader:
         action = trade['action']
         key = f"{track}:{strike}:{action}"
         self._trade_close_times[key] = datetime.fromisoformat(ts_utc)
+
+        # Console notification
+        pnl_val = pnl_touch.get('net_pnl', 0)
+        tag = 'Track A' if track == 'decision_time' else 'Track B'
+        icon = 'WIN' if pnl_val > 0 else 'LOSS'
+        if track == 'decision_time':
+            print(f"\n  <<< PAPER TRADE CLOSED [{tag}] {icon} >>>")
+            print(f"      {action} {strike} | {exit_reason} | "
+                  f"PnL(touch) ${pnl_val:+.2f} | held {hold_minutes:.0f}min")
 
 
     def _is_decision_time(self, ts_et: datetime) -> bool:

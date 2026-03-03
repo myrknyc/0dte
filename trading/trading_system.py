@@ -38,6 +38,9 @@ class TradingSystem:
         self.n_paths = N_PATHS_DEFAULT
         self.n_steps = N_STEPS_0DTE
         
+        # Diurnal vol seasonality
+        self._diurnal_params = None
+        
         # Cache for efficiency
         self._cached_paths = None
         self._cached_T = None
@@ -112,6 +115,39 @@ class TradingSystem:
             if verbose:
                 print(f"\n  IV anchor: Could not fetch ATM IV ({e}). Using calibrated v0.")
         
+        # 5c. IV surface calibration (fit Heston CF to full chain)
+        from config import USE_IV_SURFACE_CALIBRATION, IV_SURFACE_MIN_STRIKES, IV_SURFACE_MONEYNESS
+        if USE_IV_SURFACE_CALIBRATION:
+            try:
+                from calibration.heston_cf import calibrate_to_iv_surface
+                T_now = get_time_to_expiry()
+                from datetime import datetime as _dt2
+                today_str2 = _dt2.now().strftime('%Y-%m-%d')
+                chain_data = self.provider.get_option_chain(self.ticker, expiry_date=today_str2)
+                calls_df = chain_data['calls']
+                
+                iv_params, iv_quality = calibrate_to_iv_surface(
+                    calls_df, self.S0, T_now, RISK_FREE_RATE,
+                    moneyness_range=IV_SURFACE_MONEYNESS,
+                    min_strikes=IV_SURFACE_MIN_STRIKES,
+                    verbose=verbose
+                )
+                
+                # Blend: use IV-surface ρ and σ_v (these are poorly estimated
+                # from realized vol), keep realized-vol κ and θ_v
+                self.params['rho'] = iv_params['rho']
+                self.params['sigma_v'] = iv_params['sigma_v']
+                self.v0 = iv_params['v0']
+                self.params['v0'] = iv_params['v0']
+                
+                if verbose:
+                    print(f"  → IV surface overrides: ρ={iv_params['rho']:.2f}, "
+                          f"σ_v={iv_params['sigma_v']:.2f}, "
+                          f"v0={np.sqrt(iv_params['v0']):.1%}")
+            except Exception as e:
+                if verbose:
+                    print(f"\n  IV surface calibration skipped: {e}")
+        
         # 6. Calibrate jump parameters
         # Returns are 1-minute bars → dt must match that frequency
         returns = self.provider.compute_returns(self._intraday)
@@ -138,6 +174,24 @@ class TradingSystem:
             print(f"  mu_0 (VWAP): ${mr_params['mu_0']:.2f}")
         
         self.params.update(mr_params)
+        
+        # 8. Calibrate intraday vol seasonality
+        from config import USE_VOL_SEASONALITY
+        if USE_VOL_SEASONALITY:
+            try:
+                from calibration.vol_seasonality import calibrate_diurnal_from_history
+                self._diurnal_params = calibrate_diurnal_from_history(self._intraday)
+                if verbose:
+                    print(f"\nVol seasonality calibrated:")
+                    print(f"  a={self._diurnal_params['a']:.2f}, "
+                          f"b={self._diurnal_params['b']:.2f}, "
+                          f"c1={self._diurnal_params['c1']:.1f}, "
+                          f"d={self._diurnal_params['d']:.2f}, "
+                          f"c2={self._diurnal_params['c2']:.1f}")
+            except Exception as e:
+                if verbose:
+                    print(f"\n  Vol seasonality skipped: {e}")
+                self._diurnal_params = None
         
         # Clear cached paths (params changed)
         self._cached_paths = None
@@ -203,6 +257,23 @@ class TradingSystem:
                 use_jumps = False
                 bernoulli_violated = True
 
+        # Compute diurnal weights for vol seasonality
+        diurnal_w = None
+        if self._diurnal_params is not None:
+            from calibration.vol_seasonality import (
+                compute_diurnal_weights,
+                simulation_time_to_session_fraction,
+                get_current_session_fraction,
+            )
+            session_frac = get_current_session_fraction()
+            step_fracs = simulation_time_to_session_fraction(
+                times, T_bucket, session_frac
+            )
+            # weights for each step (n_steps values, one per dt interval)
+            diurnal_w = compute_diurnal_weights(
+                step_fracs[:-1], self._diurnal_params  # exclude terminal point
+            )
+
         S_paths, V_paths = simulate_combined_paths(
             S0=self.S0,
             v0=self.v0,
@@ -212,7 +283,8 @@ class TradingSystem:
             Z1=Z1,
             Z2=Z2,
             use_jumps=use_jumps,
-            use_mean_reversion=False  # Risk-neutral: no mean reversion
+            use_mean_reversion=False,  # Risk-neutral: no mean reversion
+            diurnal_weights=diurnal_w,
         )
         
         # Cache results (include T_used so pricing uses the exact T that dt_array was built from)
@@ -231,6 +303,121 @@ class TradingSystem:
         
         return self._cached_paths
     
+    def _generate_paths_adaptive(self, T, strike, spread):
+        """Error-budget-driven MC: run pilot batch, scale up if needed.
+        
+        This method does NOT use the T-bucket cache because different
+        strikes may need different path counts.
+        """
+        from config import (N_PILOT_PATHS, TARGET_ABS_ERROR,
+                            TARGET_SPREAD_FRAC, MAX_PATHS)
+        
+        T_bucket = round(T * 252 * 390) / (252 * 390)
+        r = self.params.get('r', RISK_FREE_RATE)
+        
+        # Target error: max of absolute target and fraction of spread
+        target_error = max(TARGET_ABS_ERROR, TARGET_SPREAD_FRAC * spread)
+        
+        # --- Pilot batch ---
+        times, dt_array = generate_time_grid(T_bucket, self.n_steps)
+        
+        n_pilot = N_PILOT_PATHS
+        if USE_ANTITHETIC:
+            half = n_pilot // 2
+            Z1_h, Z2_h = generate_correlated_normals(
+                half, self.n_steps, self.params['rho'])
+            Z1 = np.vstack([Z1_h, -Z1_h])
+            Z2 = np.vstack([Z2_h, -Z2_h])
+        else:
+            Z1, Z2 = generate_correlated_normals(
+                n_pilot, self.n_steps, self.params['rho'])
+        
+        # Diurnal weights
+        diurnal_w = None
+        if self._diurnal_params is not None:
+            from calibration.vol_seasonality import (
+                compute_diurnal_weights,
+                simulation_time_to_session_fraction,
+                get_current_session_fraction,
+            )
+            sf = get_current_session_fraction()
+            step_fracs = simulation_time_to_session_fraction(
+                times, T_bucket, sf)
+            diurnal_w = compute_diurnal_weights(
+                step_fracs[:-1], self._diurnal_params)
+        
+        # Bernoulli check
+        use_jumps = True
+        bernoulli_violated = False
+        lam = self.params.get('lambda_jump', 0)
+        if lam > 0 and len(dt_array) > 0:
+            valid, _ = validate_bernoulli_approximation(
+                lam, float(np.max(dt_array)), 0.01)
+            if not valid:
+                use_jumps = False
+                bernoulli_violated = True
+        
+        S_paths, V_paths = simulate_combined_paths(
+            S0=self.S0, v0=self.v0, params=self.params,
+            times=times, dt_array=dt_array, Z1=Z1, Z2=Z2,
+            use_jumps=use_jumps, use_mean_reversion=False,
+            diurnal_weights=diurnal_w,
+        )
+        
+        # Estimate std_error from pilot payoffs
+        S_T = S_paths[:, -1]
+        payoffs = np.maximum(S_T - strike, 0) * np.exp(-r * T_bucket)
+        pilot_std = np.std(payoffs, ddof=1)
+        pilot_se = pilot_std / np.sqrt(n_pilot)
+        
+        # Do we need more paths?
+        if pilot_se <= target_error or n_pilot >= MAX_PATHS:
+            return {
+                'S_paths': S_paths, 'V_paths': V_paths,
+                'times': times, 'dt_array': dt_array,
+                'Z1': Z1, 'Z2': Z2,
+                'T_used': T_bucket,
+                'bernoulli_violated': bernoulli_violated,
+                'adaptive_n': n_pilot,
+            }
+        
+        # --- Scale up ---
+        n_needed = int(np.ceil((1.96 * pilot_std / target_error) ** 2))
+        n_needed = min(n_needed, MAX_PATHS)
+        n_extra = n_needed - n_pilot
+        
+        if n_extra > 0:
+            if USE_ANTITHETIC:
+                half_e = n_extra // 2
+                Z1e_h, Z2e_h = generate_correlated_normals(
+                    half_e, self.n_steps, self.params['rho'])
+                Z1e = np.vstack([Z1e_h, -Z1e_h])
+                Z2e = np.vstack([Z2e_h, -Z2e_h])
+            else:
+                Z1e, Z2e = generate_correlated_normals(
+                    n_extra, self.n_steps, self.params['rho'])
+            
+            S_extra, V_extra = simulate_combined_paths(
+                S0=self.S0, v0=self.v0, params=self.params,
+                times=times, dt_array=dt_array, Z1=Z1e, Z2=Z2e,
+                use_jumps=use_jumps, use_mean_reversion=False,
+                diurnal_weights=diurnal_w,
+            )
+            
+            S_paths = np.vstack([S_paths, S_extra])
+            V_paths = np.vstack([V_paths, V_extra])
+            Z1 = np.vstack([Z1, Z1e])
+            Z2 = np.vstack([Z2, Z2e])
+        
+        return {
+            'S_paths': S_paths, 'V_paths': V_paths,
+            'times': times, 'dt_array': dt_array,
+            'Z1': Z1, 'Z2': Z2,
+            'T_used': T_bucket,
+            'bernoulli_violated': bernoulli_violated,
+            'adaptive_n': S_paths.shape[0],
+        }
+    
     def price_option(self, strike, T=None, option_type='call', use_control_variate=True,
                      market_iv=None, verbose=False):
         if self.S0 is None:
@@ -242,8 +429,12 @@ class TradingSystem:
         # Single-source r from params (H1)
         r = self.params.get('r', RISK_FREE_RATE)
         
-        # Generate paths
-        paths_data = self._generate_paths(T)
+        # Generate paths (adaptive or fixed)
+        from config import USE_ADAPTIVE_PATHS
+        if USE_ADAPTIVE_PATHS and hasattr(self, '_current_spread') and self._current_spread > 0:
+            paths_data = self._generate_paths_adaptive(T, strike, self._current_spread)
+        else:
+            paths_data = self._generate_paths(T)
         
         # Use the exact T that dt_array was built from (C2 — prevents CV guard failures)
         T_used = paths_data['T_used']
@@ -370,6 +561,7 @@ class TradingSystem:
             }
 
         # Get model price (pass per-strike IV for better CV performance)
+        self._current_spread = market_ask - market_bid  # for adaptive MC
         result = self.price_option(strike, option_type=option_type, market_iv=market_iv)
         model_price = result['price']
         std_error = result['std_error']
@@ -513,6 +705,7 @@ class TradingSystem:
             'market_ask': market_ask,
             'std_error': std_error,
             'spread': spread,
+            'cvar_95': result.get('cvar_95'),
             'n_paths': result.get('n_paths'),
             'variance_reduction_factor': result.get('variance_reduction_factor'),
             'beta': result.get('beta'),

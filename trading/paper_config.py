@@ -40,6 +40,7 @@ PAPER_TRADING = {
         'skip_bernoulli_violated': True,
         'max_otm_dollars': 5.0,
         'min_tte_minutes': 15,
+        'max_cvar_loss': -2.00,           # reject if avg worst-5% loss > $2 per contract
     },
 
     'selection_policy': 'risk_adjusted',
@@ -54,6 +55,13 @@ PAPER_TRADING = {
     'tp_pct': 0.20,                       # +20%
     'sl_pct': 0.15,                       # -15%
     'eod_exit_time': '15:55',
+
+    'greeks_exit': {
+        'enabled': True,
+        'theta_decay_pct': 0.80,      # exit if projected decay > 80% of time value
+        'lookforward_minutes': 15,     # projection window
+        'min_profit_pct': 0.05,        # only apply when trade is >5% profitable
+    },
 
     
     'all_signals': {

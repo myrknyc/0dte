@@ -57,6 +57,22 @@ TRADING_THRESHOLDS = {
 SPOT_MAX_AGE_SECONDS = 10       # Suppress signals if spot older than this
 SPOT_CHANGE_THRESHOLD = 0.001   # Invalidate path cache on 0.1% spot move
 
+# --- IV surface calibration ---
+USE_IV_SURFACE_CALIBRATION = True
+IV_SURFACE_MIN_STRIKES = 5        # Min liquid strikes needed for CF fit
+IV_SURFACE_MONEYNESS = (0.97, 1.03)  # K/S range to include
+
+# --- Intraday volatility seasonality (U-shape) ---
+USE_VOL_SEASONALITY = True
+DIURNAL_DEFAULT_PARAMS = {'a': 0.7, 'b': 0.5, 'c1': 8.0, 'd': 0.4, 'c2': 10.0}
+
+# --- Adaptive MC paths ---
+USE_ADAPTIVE_PATHS = False        # Currently off by default
+N_PILOT_PATHS = 5000              # Initial pilot batch
+TARGET_ABS_ERROR = 0.01           # Target absolute std error ($)
+TARGET_SPREAD_FRAC = 0.25         # Target error as fraction of spread
+MAX_PATHS = 200000                # Hard ceiling
+
 # --- Risk manager defaults ---
 RISK_DEFAULTS = {
     'sl_pct': 0.50,             # Default stop-loss percentage (50%)

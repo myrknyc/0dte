@@ -5,6 +5,7 @@ from trading.fill_model import simulate_fill, compute_fees, compute_pnl
 from trading.paper_journal import PaperJournal
 from trading.paper_trader import PaperTrader
 from trading.eod_reporter import EODReporter
+from trading.backtest_metrics import BacktestMetrics
 
 __all__ = [
     'TradingSystem',
@@ -17,4 +18,5 @@ __all__ = [
     'PaperJournal',
     'PaperTrader',
     'EODReporter',
+    'BacktestMetrics',
 ]
