@@ -41,10 +41,16 @@ PAPER_TRADING = {
         'max_otm_dollars': 5.0,
         'min_tte_minutes': 15,
         'max_cvar_loss': -2.00,           # reject if avg worst-5% loss > $2 per contract
+        'max_cvar_pct': -3.0,             # reject if CVaR / premium < -3× (normalized)
+        'min_eu': 0.0,                    # H1: only enter when EU > 0
     },
 
-    'selection_policy': 'risk_adjusted',
+    'selection_policy': 'eu_ranked',    # H8: EU / sqrt(CVaR) ranking
     'spread_floor': 0.01,                 # guard against ÷ tiny spread
+
+    # Phase 2 flags (paper-scoped — overrides global OFF defaults)
+    'use_eu_scoring': True,               # H1: EU-based entry gate
+    'use_regime_thresholds': True,        # H4: regime-adaptive filter thresholds
 
     'sizing_mode': 'fixed_contracts',     # fixed_contracts | fixed_dollar_risk | confidence_scaled
     'fixed_contracts': 1,

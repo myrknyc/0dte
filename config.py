@@ -73,6 +73,13 @@ TARGET_ABS_ERROR = 0.01           # Target absolute std error ($)
 TARGET_SPREAD_FRAC = 0.25         # Target error as fraction of spread
 MAX_PATHS = 200000                # Hard ceiling
 
+# --- Phase 2: Decision-layer intelligence ---
+# Global kill-switches. Paper-mode enables these per-track in paper_config.py.
+USE_EU_SCORING = False              # H1: EU-based entry gate
+USE_REGIME_THRESHOLDS = False       # H4: regime-adaptive filter thresholds
+USE_REGIME_JUMPS = False            # #5: regime-blend jump params
+USE_PROBABILITY_CALIBRATION = False # H2: scaffold (needs 200+ trades)
+
 # --- Risk manager defaults ---
 RISK_DEFAULTS = {
     'sl_pct': 0.50,             # Default stop-loss percentage (50%)

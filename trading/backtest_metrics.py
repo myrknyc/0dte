@@ -18,13 +18,8 @@ from zoneinfo import ZoneInfo
 
 _ET = ZoneInfo('America/New_York')
 
-# ── Regime buckets based on intraday_move_pct ────────────────
-REGIME_BUCKETS = [
-    ('calm',     0.0,  0.5),
-    ('normal',   0.5,  1.0),
-    ('volatile', 1.0,  2.0),
-    ('extreme',  2.0,  float('inf')),
-]
+# ── Regime buckets — import from canonical source ────────────
+from calibration.regime_detector import REGIME_BUCKETS
 
 MIN_SAMPLE_WARNING = 10   # flag buckets with fewer trades
 

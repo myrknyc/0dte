@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
 
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'signal_log.db')
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'signal_log.db')
 
 
 def _connect(db_path: str = None) -> sqlite3.Connection:

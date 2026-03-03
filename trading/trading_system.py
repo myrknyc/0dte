@@ -133,17 +133,23 @@ class TradingSystem:
                     verbose=verbose
                 )
                 
-                # Blend: use IV-surface ρ and σ_v (these are poorly estimated
-                # from realized vol), keep realized-vol κ and θ_v
-                self.params['rho'] = iv_params['rho']
-                self.params['sigma_v'] = iv_params['sigma_v']
-                self.v0 = iv_params['v0']
-                self.params['v0'] = iv_params['v0']
-                
-                if verbose:
-                    print(f"  → IV surface overrides: ρ={iv_params['rho']:.2f}, "
-                          f"σ_v={iv_params['sigma_v']:.2f}, "
-                          f"v0={np.sqrt(iv_params['v0']):.1%}")
+                # Quality gate: only accept if fit quality is adequate
+                if iv_quality.get('acceptable', False):
+                    # Blend: use IV-surface ρ and σ_v (these are poorly estimated
+                    # from realized vol), keep realized-vol κ and θ_v
+                    self.params['rho'] = iv_params['rho']
+                    self.params['sigma_v'] = iv_params['sigma_v']
+                    self.v0 = iv_params['v0']
+                    self.params['v0'] = iv_params['v0']
+                    
+                    if verbose:
+                        print(f"  → IV surface overrides: ρ={iv_params['rho']:.2f}, "
+                              f"σ_v={iv_params['sigma_v']:.2f}, "
+                              f"v0={np.sqrt(iv_params['v0']):.1%}")
+                else:
+                    if verbose:
+                        print(f"  → IV surface fit rejected (RMSE=${iv_quality['rmse']:.4f}, "
+                              f"MAPE={iv_quality['mape']:.1%}). Keeping prior params.")
             except Exception as e:
                 if verbose:
                     print(f"\n  IV surface calibration skipped: {e}")
@@ -155,10 +161,47 @@ class TradingSystem:
         jump_params = calibrate_from_returns(returns, dt=intraday_dt)
         
         if verbose:
-            print(f"\nJump calibration:")
+            print(f"\nJump calibration (raw):")
             print(f"  lambda_jump: {jump_params['lambda_jump']:.4f}")
             print(f"  mu_jump: {jump_params['mu_jump']:.4f}")
             print(f"  sigma_jump: {jump_params['sigma_jump']:.4f}")
+        
+        # 6b. Regime-adaptive jump blending (#5)
+        from config import USE_REGIME_JUMPS
+        if USE_REGIME_JUMPS:
+            from calibration.regime_detector import classify, blend_jump_params
+            # Compute intraday move % from open
+            open_price = self._intraday['Open'].iloc[0]
+            intraday_move_pct = abs(self.S0 - open_price) / open_price * 100
+            self._current_regime = classify(intraday_move_pct)
+            self._intraday_move_pct = intraday_move_pct
+            
+            # Variance stability: ratio of recent (last 30 bars) to full-session variance
+            recent_n = min(30, len(returns))
+            recent_var = float(np.var(returns[-recent_n:])) if recent_n > 1 else 0.0
+            full_var = float(np.var(returns)) if len(returns) > 1 else 1e-8
+            variance_stability = recent_var / max(full_var, 1e-8)
+            
+            blended = blend_jump_params(
+                jump_params, self._current_regime,
+                n_returns=len(returns),
+                variance_stability=variance_stability
+            )
+            
+            if verbose:
+                from calibration.regime_detector import regime_blend_weight
+                w = regime_blend_weight(len(returns), variance_stability)
+                print(f"\n  Regime: {self._current_regime} "
+                      f"(move={intraday_move_pct:.2f}%)")
+                print(f"  Blend weight w={w:.2f} "
+                      f"(n={len(returns)}, var_ratio={variance_stability:.2f})")
+                print(f"  Blended λ={blended['lambda_jump']:.2f} "
+                      f"(raw={jump_params['lambda_jump']:.2f})")
+            
+            jump_params = blended
+        else:
+            self._current_regime = 'unknown'
+            self._intraday_move_pct = None
         
         self.params.update(jump_params)
         
@@ -431,7 +474,16 @@ class TradingSystem:
         
         # Generate paths (adaptive or fixed)
         from config import USE_ADAPTIVE_PATHS
-        if USE_ADAPTIVE_PATHS and hasattr(self, '_current_spread') and self._current_spread > 0:
+        use_adaptive = USE_ADAPTIVE_PATHS
+        
+        # Auto-enable adaptive paths for OTM or wide-spread strikes
+        # even when globally OFF — MC error dominates edge on these
+        if not use_adaptive and hasattr(self, '_current_spread') and self._current_spread > 0:
+            otm = abs(strike - self.S0) if self.S0 else 0
+            if otm > 2.0 or self._current_spread > 0.10:
+                use_adaptive = True
+        
+        if use_adaptive and hasattr(self, '_current_spread') and self._current_spread > 0:
             paths_data = self._generate_paths_adaptive(T, strike, self._current_spread)
         else:
             paths_data = self._generate_paths(T)
@@ -706,6 +758,9 @@ class TradingSystem:
             'std_error': std_error,
             'spread': spread,
             'cvar_95': result.get('cvar_95'),
+            'payoff_mean_pos': result.get('payoff_mean_pos', 0.0),
+            'payoff_mean_zero': result.get('payoff_mean_zero', 0.0),
+            'payoff_frac_pos': result.get('payoff_frac_pos', 0.0),
             'n_paths': result.get('n_paths'),
             'variance_reduction_factor': result.get('variance_reduction_factor'),
             'beta': result.get('beta'),

@@ -5,7 +5,9 @@ import json
 
 from trading.paper_config import PAPER_TRADING
 from trading.fill_model import simulate_fill, compute_fees, compute_pnl
+from trading.fill_model import _fees_per_contract, _compute_slippage
 from trading.paper_journal import PaperJournal, now_utc, to_utc_str
+from calibration.probability_calibrator import ProbabilityCalibrator
 
 _ET = ZoneInfo('America/New_York')
 
@@ -28,14 +30,32 @@ class PaperTrader:
         self._open_trades_b: Dict[str, dict] = {}
         self._trade_close_times: Dict[str, datetime] = {}  # last close per (strike, action, track)
 
+        # H2 scaffold: probability calibrator (passthrough by default)
+        self._calibrator = ProbabilityCalibrator()
+
+        # Current regime (set per scan by on_scan or _make_decision_a)
+        self._current_regime = 'unknown'
+        self._intraday_move_pct = None
+
     # ================================================================== #
     #  Main entry point                                                    #
     # ================================================================== #
 
     def on_scan(self, signals: List[dict], quote_map: Dict[float, dict],
-                spot: float, timestamp_et: datetime):
+                spot: float, timestamp_et: datetime,
+                intraday_move_pct: float = None,
+                trading_system=None):
         
         ts_utc = to_utc_str(timestamp_et)
+
+        # Capture regime from trading system or explicit param
+        if trading_system and hasattr(trading_system, '_current_regime'):
+            self._current_regime = getattr(trading_system, '_current_regime', 'unknown')
+            self._intraday_move_pct = getattr(trading_system, '_intraday_move_pct', None)
+        elif intraday_move_pct is not None:
+            from calibration.regime_detector import classify
+            self._current_regime = classify(intraday_move_pct)
+            self._intraday_move_pct = intraday_move_pct
 
         # 1. Record quotes to tape (always, for forward eval)
         self._record_quotes(quote_map, spot, ts_utc)
@@ -62,9 +82,16 @@ class PaperTrader:
         rejections: Dict[str, int] = {}
         eligible = []
 
+        # ── Regime overlay (H4): adjust thresholds for current regime ──
+        filters = dict(self.cfg.get('filters', {}))
+        if self.cfg.get('use_regime_thresholds', False):
+            from calibration.regime_detector import get_adjusted_thresholds
+            regime_overrides = get_adjusted_thresholds(self._current_regime)
+            filters.update(regime_overrides)
+
         # ── Filter ──
         for sig in signals:
-            reason = self._check_eligibility_a(sig)
+            reason = self._check_eligibility_a(sig, filters_override=filters)
             if reason:
                 rejections[reason] = rejections.get(reason, 0) + 1
                 self.journal.log_skip(track, sig, reason)
@@ -111,11 +138,13 @@ class PaperTrader:
             n_eligible=len(eligible), n_selected=len(selected),
             n_entered=n_entered, rejection_breakdown=rejections,
             signals_json=json.dumps([_signal_summary(s) for s in signals], default=str),
+            intraday_move_pct=self._intraday_move_pct,
         )
 
-    def _check_eligibility_a(self, sig: dict) -> Optional[str]:
+    def _check_eligibility_a(self, sig: dict,
+                             filters_override: dict = None) -> Optional[str]:
         """Return rejection reason or None if eligible."""
-        f = self.cfg.get('filters', {})
+        f = filters_override or self.cfg.get('filters', {})
         action = sig.get('action', 'HOLD')
 
         if action == 'HOLD':
@@ -157,14 +186,86 @@ class PaperTrader:
             # We can't precisely check TTE without the timestamp, so skip
             # this filter gracefully (it's enforced by the caller context)
 
-        # CVaR tail-risk filter
+        # CVaR tail-risk filter (absolute $ OR % of premium)
         cvar = sig.get('cvar_95')
-        max_cvar_loss = f.get('max_cvar_loss')
-        if cvar is not None and max_cvar_loss is not None and cvar < max_cvar_loss:
-            return 'tail_risk_too_high'
+        if cvar is not None:
+            # Absolute dollar threshold
+            max_cvar_loss = f.get('max_cvar_loss')
+            if max_cvar_loss is not None and cvar < max_cvar_loss:
+                return 'tail_risk_too_high'
+            
+            # Premium-normalized threshold: cvar/premium < max_cvar_pct
+            # e.g. max_cvar_pct=-3.0 means reject if tail loss > 3× premium
+            max_cvar_pct = f.get('max_cvar_pct')
+            premium = sig.get('model_price', 0) or sig.get('market_mid', 0)
+            if max_cvar_pct is not None and premium > 0.01:
+                cvar_ratio = cvar / premium
+                if cvar_ratio < max_cvar_pct:
+                    return 'tail_risk_too_high'
+
+        # H1: EU gate (if enabled)
+        if self.cfg.get('use_eu_scoring', False):
+            eu = self._compute_eu(sig)
+            sig['eu_score'] = eu
+            min_eu = f.get('min_eu', 0.0)
+            if eu < min_eu:
+                return 'negative_eu'
 
         return None  # eligible
 
+    # ================================================================== #
+    #  H1 / H8: EU scoring and cost accounting                             #
+    # ================================================================== #
+
+    def _compute_eu(self, sig: dict) -> float:
+        """Compute expected utility: EU = p·G − (1−p)·L − C.
+
+        G and L are in PnL-space (not payoff-space).
+        Direction-aware: BUY and SELL have mirrored G/L transforms.
+        Cost C is round-trip friction counted exactly once.
+        """
+        p = self._calibrator.calibrate(sig.get('confidence', 0))
+        action = sig.get('action', 'HOLD')
+
+        payoff_pos = sig.get('payoff_mean_pos', 0)   # E[payoff | payoff > 0]
+        payoff_zero = sig.get('payoff_mean_zero', 0)  # E[|payoff| | payoff ≤ 0]
+
+        if action == 'BUY':
+            exec_price = sig.get('market_ask', 0)
+            # Win: payoff > entry price → surplus
+            G = max(0.0, payoff_pos - exec_price)
+            # Lose: payoff < entry price → loss
+            L = max(0.0, exec_price - payoff_zero)
+        elif action == 'SELL':
+            exec_price = sig.get('market_bid', 0)
+            # Win: option expires worthless/cheap → keep premium
+            G = max(0.0, exec_price - payoff_zero)
+            # Lose: option rallies → must buy back at higher price
+            L = max(0.0, payoff_pos - exec_price)
+        else:
+            return 0.0
+
+        C = self._round_trip_cost(sig)
+
+        return p * G - (1 - p) * L - C
+
+    def _round_trip_cost(self, sig: dict) -> float:
+        """Entry + exit friction in option-price units (per contract ÷ 100).
+
+        Uses fill_model for consistency with PnL computation.
+        Counted exactly once — do not add spread penalties elsewhere.
+        """
+        spread = sig.get('spread', 0)
+
+        # Fees: entry + exit (2 legs)
+        fees = _fees_per_contract(self.cfg) * 2
+
+        # Slippage: entry + exit
+        slip_in = _compute_slippage(spread, self.cfg, direction=1)
+        slip_out = _compute_slippage(spread, self.cfg, direction=-1)
+
+        # Convert fees from per-contract-$ to per-option-$ (÷100 multiplier)
+        return (fees / 100.0) + slip_in + slip_out
 
     def _enter_all_signals_b(self, signals: List[dict], quote_map: Dict,
                              spot: float, ts_et: datetime, ts_utc: str):
@@ -366,7 +467,7 @@ class PaperTrader:
             if unrealized_pct <= -sl:
                 return 'stop_loss'
 
-        # ── Theta-decay-aware exit ──
+        # ── Theta-decay-aware exit (improved) ──
         greeks_cfg = self.cfg.get('greeks_exit', {})
         if greeks_cfg.get('enabled', False) and ts_et is not None and spot is not None:
             min_profit = greeks_cfg.get('min_profit_pct', 0.05)
@@ -381,7 +482,7 @@ class PaperTrader:
                 else:
                     intrinsic = max(0.0, strike - spot)
 
-                # Time value = option mid − intrinsic (per contract)
+                # Time value = option mid − intrinsic
                 time_value = max(0.0, mid - intrinsic)
 
                 # Minutes remaining until EOD
@@ -391,15 +492,26 @@ class PaperTrader:
                 now_minutes = ts_et.hour * 60 + ts_et.minute
                 minutes_left = max(1, eod_minutes - now_minutes)
 
-                # Linear theta estimate: time_value decays to ~0 by close
-                theta_per_min = time_value / minutes_left
-                lookforward = greeks_cfg.get('lookforward_minutes', 15)
-                decay_threshold = greeks_cfg.get('theta_decay_pct', 0.80)
+                # Don't fire theta exit right before close — EOD exit handles that
+                min_minutes = greeks_cfg.get('min_minutes_left', 5)
+                if minutes_left <= min_minutes:
+                    pass  # skip theta check, let EOD handle it
+                elif time_value > 0:
+                    lookforward = greeks_cfg.get('lookforward_minutes', 15)
+                    decay_threshold = greeks_cfg.get('theta_decay_pct', 0.80)
 
-                projected_decay = theta_per_min * lookforward
+                    # √t decay model: theta ∝ 1/√(minutes_left)
+                    # Projected fraction of time_value lost in lookforward window:
+                    #   1 - √(minutes_left - lookforward) / √(minutes_left)
+                    remaining_after = max(1, minutes_left - lookforward)
+                    projected_decay_frac = 1.0 - (remaining_after / minutes_left) ** 0.5
 
-                if time_value > 0 and projected_decay > decay_threshold * time_value:
-                    return 'theta_decay'
+                    # Spread cost guard: don't exit if spread > remaining time value
+                    exit_spread = ask - bid
+                    if exit_spread > 0.8 * time_value:
+                        pass  # spread would eat most of what we're trying to save
+                    elif projected_decay_frac > decay_threshold:
+                        return 'theta_decay'
 
         # Time exit
         if mode in ('time', 'hybrid'):
@@ -535,6 +647,11 @@ class PaperTrader:
             elif policy == 'closest_to_spot':
                 otm = s.get('otm_dollars', 0)
                 return -otm
+            elif policy == 'eu_ranked':
+                # H8: score = EU / sqrt(|CVaR|)
+                eu = s.get('eu_score', edge * conf)  # fallback if EU not computed
+                cvar = abs(s.get('cvar_95', 1.0)) or 1.0
+                return eu / max(0.01, cvar ** 0.5)
             else:
                 return edge * conf / spread
 

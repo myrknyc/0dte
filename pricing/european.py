@@ -162,6 +162,14 @@ def price_european_option(S_paths, K, T, r, option_type='call',
     ci_lower = price - 1.96 * std_error if np.isfinite(std_error) else float('nan')
     ci_upper = price + 1.96 * std_error if np.isfinite(std_error) else float('nan')
     
+    # Payoff distribution stats (model-pure, no execution price)
+    # Used by trader layer to compute PnL-space G/L for EU scoring
+    pos_mask = payoffs_for_pricing > 0
+    neg_mask = ~pos_mask
+    payoff_mean_pos = float(np.mean(payoffs_for_pricing[pos_mask])) if np.any(pos_mask) else 0.0
+    payoff_mean_zero = float(np.mean(np.abs(payoffs_for_pricing[neg_mask]))) if np.any(neg_mask) else 0.0
+    payoff_frac_pos = float(np.sum(pos_mask) / n_paths)
+
     elapsed_time = time.time() - start_time
     
     # Build result dictionary
@@ -169,6 +177,9 @@ def price_european_option(S_paths, K, T, r, option_type='call',
         'price': price,
         'std_error': std_error,
         'cvar_95': cvar_95,
+        'payoff_mean_pos': payoff_mean_pos,
+        'payoff_mean_zero': payoff_mean_zero,
+        'payoff_frac_pos': payoff_frac_pos,
         'confidence_interval': (ci_lower, ci_upper),
         'n_paths': n_paths,
         'elapsed_time': elapsed_time,

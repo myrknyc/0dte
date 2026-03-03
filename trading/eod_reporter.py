@@ -218,12 +218,16 @@ class EODReporter:
 
     def compute_forward_accuracy(self, run_id: str, track: str = None,
                                  date_str: str = None) -> Dict:
-        """Compute forward return accuracy at configured horizons.
+        """Compute directional hit-rate at configured forward horizons.
+
+        This is a DIRECTION-ONLY metric: did mid price move in the signal's
+        favor at horizon T?  It ignores bid-ask spread, slippage, and fees.
+        Do NOT interpret this as realized PnL accuracy.
 
         Uses the quote tape to evaluate whether each trade's direction
         was correct at 1/3/5/10/15/30/60 minute horizons.
 
-        Returns dict of {horizon_min: {total, correct, accuracy}}.
+        Returns dict of {horizon_min: {total, correct, hit_rate}}.  
         """
         horizons = self.cfg.get('eval_horizons_minutes', [1, 5, 15, 30, 60])
         max_gap = self.cfg.get('max_quote_gap_minutes_for_forward_eval', 2)
@@ -278,10 +282,12 @@ class EODReporter:
                         elif action == 'SELL' and future_mid < entry_mid:
                             results[horizon]['correct'] += 1
 
-        # Compute accuracy
+        # Compute hit-rate
         for h in horizons:
             r = results[h]
-            r['accuracy'] = r['correct'] / r['total'] if r['total'] > 0 else 0.0
+            r['hit_rate'] = r['correct'] / r['total'] if r['total'] > 0 else 0.0
+            # Keep 'accuracy' as alias for backward compat
+            r['accuracy'] = r['hit_rate']
 
         return results
 
@@ -290,7 +296,7 @@ class EODReporter:
         tracks = self.cfg.get('tracks', ['decision_time', 'all_signals'])
 
         print(f"\n{'─'*65}")
-        print(f"  🎯 FORWARD ACCURACY (from quote tape)")
+        print(f"  🎯 DIRECTIONAL HIT-RATE (mid-price only, excludes costs)")
         print(f"{'─'*65}")
 
         for track in tracks:
@@ -302,11 +308,11 @@ class EODReporter:
                 continue
 
             print(f"\n  {label}:")
-            print(f"    {'Horizon':>10}  {'Trades':>6}  {'Correct':>7}  {'Accuracy':>8}")
+            print(f"    {'Horizon':>10}  {'Trades':>6}  {'Correct':>7}  {'Hit Rate':>8}")
             for h in sorted(results):
                 r = results[h]
-                acc = f"{r['accuracy']*100:.1f}%" if r['total'] > 0 else 'N/A'
-                print(f"    {h:>7} min  {r['total']:>6}  {r['correct']:>7}  {acc:>8}")
+                hr = f"{r['hit_rate']*100:.1f}%" if r['total'] > 0 else 'N/A'
+                print(f"    {h:>7} min  {r['total']:>6}  {r['correct']:>7}  {hr:>8}")
 
     # ================================================================== #
     #  CSV export                                                          #

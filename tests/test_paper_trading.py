@@ -101,6 +101,11 @@ def _make_signal(strike=590.0, action='BUY', confidence=0.80, edge=0.05,
         'bernoulli_violated': bernoulli_violated,
         'ticker': 'SPY',
         'option_type': 'call',
+        'spread': ask - bid,
+        # Payoff distribution stats for EU scoring
+        'payoff_mean_pos': ask * 1.3,   # 30% above ask → profitable
+        'payoff_mean_zero': 0.0,
+        'payoff_frac_pos': 0.6,
     }
     sig.update(kwargs)
     return sig

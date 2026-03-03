@@ -101,6 +101,10 @@ def heston_cf_price(S, K, T, r, kappa, theta_v, sigma_v, rho, v0,
         else:
             return max(K - S, 0.0)
 
+    # Adaptive integration upper bound: CF decays faster for short T
+    # For T~30min (0.0002yr), 50/sqrt(T) ≈ 3500 — overkill, so cap at 500
+    u_max = min(500.0, max(50.0, 50.0 / np.sqrt(T)))
+
     # Gil-Pelaez: P_j = 0.5 + (1/π) ∫₀^∞ Re[...] du
     args = (S, K, T, r, kappa, theta_v, sigma_v, rho, v0)
 
@@ -108,9 +112,9 @@ def heston_cf_price(S, K, T, r, kappa, theta_v, sigma_v, rho, v0,
         warnings.simplefilter("ignore")
 
         int1, _ = quad(lambda u: _integrand_P(u, 1, *args),
-                       1e-8, 200, limit=200)
+                       1e-8, u_max, limit=300)
         int2, _ = quad(lambda u: _integrand_P(u, 2, *args),
-                       1e-8, 200, limit=200)
+                       1e-8, u_max, limit=300)
 
     P1 = 0.5 + int1 / np.pi
     P2 = 0.5 + int2 / np.pi
@@ -261,15 +265,21 @@ def calibrate_to_iv_surface(option_chain, S0, T, r=RISK_FREE_RATE,
     residuals = model_prices - market_prices
     rmse = float(np.sqrt(np.mean(residuals ** 2)))
 
+    # Mean absolute % error vs market mid
+    mape = float(np.mean(np.abs(residuals) / np.maximum(market_prices, 0.01)))
+
     quality = {
         'rmse': rmse,
+        'mape': mape,
         'n_strikes': len(strikes),
         'residuals': residuals.tolist(),
         'objective': float(result.fun),
+        'acceptable': rmse < 0.10 and mape < 0.50,  # quality gate
     }
 
     if verbose:
-        print(f"  IV surface fit: RMSE=${rmse:.4f} over {len(strikes)} strikes")
+        status = 'ACCEPTED' if quality['acceptable'] else 'REJECTED (poor fit)'
+        print(f"  IV surface fit: RMSE=${rmse:.4f}  MAPE={mape:.1%}  [{status}]")
         print(f"    κ={kappa:.2f}  θ_v={theta_v:.4f} ({np.sqrt(theta_v):.1%})  "
               f"σ_v={sigma_v:.2f}  ρ={rho:.2f}  v0={v0:.4f} ({np.sqrt(v0):.1%})")
 

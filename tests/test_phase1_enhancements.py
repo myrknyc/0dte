@@ -181,9 +181,10 @@ def test_theta_exit_fires_near_close():
         'eod_exit_time': '15:55',
         'greeks_exit': {
             'enabled': True,
-            'theta_decay_pct': 0.80,
+            'theta_decay_pct': 0.45,       # lowered threshold for sqrt model
             'lookforward_minutes': 15,
             'min_profit_pct': 0.05,
+            'min_minutes_left': 5,
         },
     }
 
@@ -201,12 +202,14 @@ def test_theta_exit_fires_near_close():
         'option_type': 'call',
     }
 
-    # 15:50 ET, 5 min before EOD — profitable trade with lots of time value
-    ts_et = datetime(2026, 3, 3, 15, 50, tzinfo=ZoneInfo('America/New_York'))
-    spot = 601.0  # slightly ITM
+    # 15:35 ET — 20 min before EOD, profitable trade with time value
+    # sqrt model: remaining_after = max(1, 20-15)=5, decay_frac = 1 - sqrt(5/20) = 0.50
+    # 0.50 > 0.45 threshold → should fire
+    ts_et = datetime(2026, 3, 3, 15, 35, tzinfo=ZoneInfo('America/New_York'))
+    spot = 601.0  # slightly ITM: intrinsic=$1, mid=$1.80, time_value=$0.80
 
-    # bid/ask → mid=1.80, so +20% profit
-    reason = pt._check_exit_a(trade, bid=1.70, ask=1.90, hold_minutes=30,
+    # bid/ask → mid=1.80, narrow spread (0.04 < 0.8 * 0.80 = 0.64)
+    reason = pt._check_exit_a(trade, bid=1.78, ask=1.82, hold_minutes=30,
                                quote_fresh=True, ts_et=ts_et, spot=spot)
 
     print(f"  Exit reason: {reason}")

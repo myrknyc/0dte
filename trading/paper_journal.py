@@ -220,7 +220,12 @@ class PaperJournal:
                    decision_timestamp_utc: str = None) -> str:
         """Insert a new OPEN paper trade, return trade_id."""
         trade_id = str(uuid.uuid4())
-        today = datetime.fromisoformat(timestamp_utc).strftime('%Y-%m-%d')
+        # Use ET session date (not UTC date) so a single trading day isn't
+        # split by the midnight-UTC boundary
+        utc_dt = datetime.fromisoformat(timestamp_utc)
+        if utc_dt.tzinfo is None:
+            utc_dt = utc_dt.replace(tzinfo=_UTC)
+        today = utc_dt.astimezone(_ET).strftime('%Y-%m-%d')
 
         self.conn.execute("""
             INSERT INTO paper_trades
