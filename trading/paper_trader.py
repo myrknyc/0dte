@@ -92,6 +92,7 @@ class PaperTrader:
 
         # ── Regime overlay (H4): adjust thresholds for current regime ──
         filters = dict(self.cfg.get('filters', {}))
+        filters['_use_eu_scoring'] = self.cfg.get('use_eu_scoring', False)
         if self.cfg.get('use_regime_thresholds', False):
             from calibration.regime_detector import get_adjusted_thresholds
             regime_overrides = get_adjusted_thresholds(self._current_regime)
@@ -147,6 +148,7 @@ class PaperTrader:
             n_entered=n_entered, rejection_breakdown=rejections,
             signals_json=json.dumps([_signal_summary(s) for s in signals], default=str),
             intraday_move_pct=self._intraday_move_pct,
+            regime=self._current_regime,
         )
 
     def _check_eligibility_a(self, sig: dict,
@@ -211,8 +213,8 @@ class PaperTrader:
                 if cvar_ratio < max_cvar_pct:
                     return 'tail_risk_too_high'
 
-        # H1: EU gate (if enabled)
-        if self.cfg.get('use_eu_scoring', False):
+        # H1: EU gate (if enabled — per-track via filters_override)
+        if f.get('_use_eu_scoring', False):
             eu = self._compute_eu(sig)
             sig['eu_score'] = eu
             min_eu = f.get('min_eu', 0.0)
@@ -333,6 +335,7 @@ class PaperTrader:
 
         # Build Track C filter config (merge base with track-specific)
         c_filters = dict(c_cfg.get('filters', self.cfg.get('filters', {})))
+        c_filters['_use_eu_scoring'] = c_cfg.get('use_eu_scoring', False)
 
         # Regime overlay (H4) if enabled for Track C
         if c_cfg.get('use_regime_thresholds', False):
@@ -408,6 +411,7 @@ class PaperTrader:
             n_entered=n_entered, rejection_breakdown=rejections,
             signals_json=json.dumps([_signal_summary(s) for s in signals], default=str),
             intraday_move_pct=self._intraday_move_pct,
+            regime=self._current_regime,
         )
 
     def _check_eligibility_b(self, sig: dict, apply: dict) -> Optional[str]:
@@ -771,7 +775,11 @@ class PaperTrader:
                 return -otm
             elif policy == 'eu_ranked':
                 # H8: score = EU / sqrt(|CVaR|)
-                eu = s.get('eu_score', edge * conf)  # fallback if EU not computed
+                # Compute EU if not already set by eligibility gate
+                eu = s.get('eu_score')
+                if eu is None:
+                    eu = self._compute_eu(s)
+                    s['eu_score'] = eu
                 cvar = abs(s.get('cvar_95', 1.0)) or 1.0
                 return eu / max(0.01, cvar ** 0.5)
             else:

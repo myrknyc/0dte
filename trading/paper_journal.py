@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any
 from zoneinfo import ZoneInfo
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _ET = ZoneInfo('America/New_York')
 _UTC = ZoneInfo('UTC')
 
@@ -146,6 +146,7 @@ class PaperJournal:
                 timestamp_utc           TEXT NOT NULL,
                 spot_price              REAL,
                 intraday_move_pct       REAL,
+                regime                  TEXT,
                 n_signals               INTEGER,
                 n_eligible              INTEGER,
                 n_selected              INTEGER,
@@ -183,9 +184,15 @@ class PaperJournal:
 
     def _migrate(self, from_version: int):
         """Incremental migrations.  Add new blocks as schema evolves."""
-        # if from_version < 2:
-        #     ...
-        #     from_version = 2
+        if from_version < 2:
+            # Phase 2.5: add regime label to snapshots
+            try:
+                self.conn.execute(
+                    "ALTER TABLE decision_snapshots ADD COLUMN regime TEXT"
+                )
+            except Exception:
+                pass  # column may already exist
+            from_version = 2
         self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.conn.commit()
 
@@ -415,17 +422,18 @@ class PaperJournal:
                         rejection_breakdown: dict = None,
                         signals_json: str = None,
                         context: dict = None,
-                        intraday_move_pct: float = None):
+                        intraday_move_pct: float = None,
+                        regime: str = None):
         snap_id = str(uuid.uuid4())
         self.conn.execute("""
             INSERT INTO decision_snapshots
                 (snap_id, run_id, track, timestamp_utc, spot_price,
-                 intraday_move_pct,
+                 intraday_move_pct, regime,
                  n_signals, n_eligible, n_selected, n_entered,
                  rejection_breakdown_json, signals_json, context_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (snap_id, run_id, track, timestamp_utc, spot_price,
-              intraday_move_pct,
+              intraday_move_pct, regime,
               n_signals, n_eligible, n_selected, n_entered,
               json.dumps(rejection_breakdown, default=str) if rejection_breakdown else None,
               signals_json,

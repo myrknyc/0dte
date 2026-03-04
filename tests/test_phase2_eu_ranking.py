@@ -278,7 +278,11 @@ class TestNegativeEURejection:
                 'spot_age_seconds': 2,
                 'otm_dollars': 1.0,
             }
-            reason = trader._check_eligibility_a(sig)
+            # Build filters with EU enabled (per-track scoping fix)
+            filters = dict(cfg.get('filters', {}))
+            filters['_use_eu_scoring'] = True
+            filters['min_eu'] = 0.0
+            reason = trader._check_eligibility_a(sig, filters_override=filters)
             assert reason == 'negative_eu', f"Expected 'negative_eu', got '{reason}'"
         finally:
             journal.close()

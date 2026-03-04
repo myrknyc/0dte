@@ -636,5 +636,5 @@ class TestSchema:
             assert t in tables, f"Missing table: {t}"
 
         ver = j.conn.execute("PRAGMA user_version").fetchone()[0]
-        assert ver == 1
+        assert ver == 2
         j.close()
