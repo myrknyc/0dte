@@ -28,6 +28,7 @@ class PaperTrader:
         # In-memory cache of open trades (synced with DB)
         self._open_trades_a: Dict[str, dict] = {}  # trade_id → trade row
         self._open_trades_b: Dict[str, dict] = {}
+        self._open_trades_c: Dict[str, dict] = {}  # Track C: buy-only
         self._trade_close_times: Dict[str, datetime] = {}  # last close per (strike, action, track)
 
         # H2 scaffold: probability calibrator (passthrough by default)
@@ -70,6 +71,13 @@ class PaperTrader:
             enter_on = b_cfg.get('enter_on', 'every_scan')
             if enter_on == 'every_scan' or self._is_decision_time(timestamp_et):
                 self._enter_all_signals_b(signals, quote_map, spot, timestamp_et, ts_utc)
+
+        # 4. Track C: buy_only
+        c_cfg = self.cfg.get('buy_only', {})
+        if c_cfg.get('enabled', False):
+            enter_on = c_cfg.get('enter_on', 'decision_time')
+            if enter_on == 'every_scan' or self._is_decision_time(timestamp_et):
+                self._make_decision_c(signals, quote_map, spot, timestamp_et, ts_utc)
 
         # 4. Check exits for both tracks
         self._check_exits(quote_map, timestamp_et, ts_utc)
@@ -307,6 +315,101 @@ class PaperTrader:
             rejection_breakdown=rejections,
         )
 
+    # ================================================================== #
+    #  Track C: buy-only (calls + puts, no selling)                        #
+    # ================================================================== #
+
+    def _make_decision_c(self, signals: List[dict], quote_map: Dict,
+                         spot: float, ts_et: datetime, ts_utc: str):
+        """Filter → rank → select → enter for Track C (buy-only).
+        
+        Only BUY signals are accepted. Calls and puts both allowed.
+        Uses Track C-specific config for thresholds, limits, and policy.
+        """
+        track = 'buy_only'
+        c_cfg = self.cfg.get('buy_only', {})
+        rejections: Dict[str, int] = {}
+        eligible = []
+
+        # Build Track C filter config (merge base with track-specific)
+        c_filters = dict(c_cfg.get('filters', self.cfg.get('filters', {})))
+
+        # Regime overlay (H4) if enabled for Track C
+        if c_cfg.get('use_regime_thresholds', False):
+            from calibration.regime_detector import get_adjusted_thresholds
+            regime_overrides = get_adjusted_thresholds(self._current_regime)
+            c_filters.update(regime_overrides)
+
+        # Filter
+        allowed_types = c_cfg.get('option_types', ['call', 'put'])
+        for sig in signals:
+            action = sig.get('action', 'HOLD')
+            opt_type = sig.get('option_type', 'call')
+
+            # Track C: BUY only
+            if action != 'BUY':
+                rejections['not_buy'] = rejections.get('not_buy', 0) + 1
+                continue
+
+            # Option type filter
+            if opt_type not in allowed_types:
+                rejections['wrong_type'] = rejections.get('wrong_type', 0) + 1
+                continue
+
+            # Apply standard eligibility with Track C filters
+            reason = self._check_eligibility_a(sig, filters_override=c_filters)
+            if reason:
+                rejections[reason] = rejections.get(reason, 0) + 1
+                self.journal.log_skip(track, sig, reason)
+            else:
+                eligible.append(sig)
+
+        # Diversify
+        eligible = self._diversify(eligible)
+
+        # Rank (using Track C policy)
+        c_policy = c_cfg.get('selection_policy', self.cfg.get('selection_policy', 'eu_ranked'))
+        old_policy = self.cfg.get('selection_policy')
+        self.cfg['selection_policy'] = c_policy
+        ranked = self._rank_signals(eligible)
+        self.cfg['selection_policy'] = old_policy  # restore
+
+        # Select top-N
+        max_trades = c_cfg.get('max_trades_per_decision', 1)
+        max_open = c_cfg.get('max_open_positions', 3)
+        current_open = len(self._open_trades_c)
+        slots = min(max_trades, max_open - current_open)
+        selected = ranked[:max(0, slots)]
+
+        # Enter
+        n_entered = 0
+        for sig in selected:
+            if self._in_cooldown(sig, track, ts_et):
+                rejections['cooldown'] = rejections.get('cooldown', 0) + 1
+                self.journal.log_skip(track, sig, 'cooldown')
+                continue
+            self._enter_trade(sig, spot, ts_utc, track, decision_ts=ts_utc)
+            n_entered += 1
+
+        # Console summary
+        time_str = ts_et.strftime('%H:%M')
+        print(f"\n  [Paper] Track C Decision @ {time_str} ET: "
+              f"{len(signals)} signals -> {len(eligible)} eligible -> "
+              f"{n_entered} entered | {len(self._open_trades_c)} open")
+        if rejections:
+            rej_str = ', '.join(f'{k}:{v}' for k, v in sorted(rejections.items(), key=lambda x: -x[1]))
+            print(f"           Rejections: {rej_str}")
+
+        # Snapshot
+        self.journal.record_snapshot(
+            run_id=self.run_id, track=track, timestamp_utc=ts_utc,
+            spot_price=spot, n_signals=len(signals),
+            n_eligible=len(eligible), n_selected=len(selected),
+            n_entered=n_entered, rejection_breakdown=rejections,
+            signals_json=json.dumps([_signal_summary(s) for s in signals], default=str),
+            intraday_move_pct=self._intraday_move_pct,
+        )
+
     def _check_eligibility_b(self, sig: dict, apply: dict) -> Optional[str]:
         """Minimal data-integrity filters for Track B."""
         if apply.get('use_spot_age', True):
@@ -368,7 +471,17 @@ class PaperTrader:
         if track == 'decision_time':
             self._open_trades_a[trade_id] = trade
             print(f"\n  >>> PAPER TRADE ENTERED [Track A] <<<")
-            print(f"      {action} {sig.get('strike')} @ mid=${fill['mid']:.4f}  "
+            print(f"      {action} {sig.get('option_type', 'call').upper()} "
+                  f"{sig.get('strike')} @ mid=${fill['mid']:.4f}  "
+                  f"touch=${fill['touch']:.4f}  spread=${fill['spread']:.4f}")
+            print(f"      edge={sig.get('edge', 0)*100:.1f}%  "
+                  f"conf={sig.get('confidence', 0)*100:.0f}%  "
+                  f"OTM=${sig.get('otm_dollars', 0):.1f}")
+        elif track == 'buy_only':
+            self._open_trades_c[trade_id] = trade
+            print(f"\n  >>> PAPER TRADE ENTERED [Track C] <<<")
+            print(f"      BUY {sig.get('option_type', 'call').upper()} "
+                  f"{sig.get('strike')} @ mid=${fill['mid']:.4f}  "
                   f"touch=${fill['touch']:.4f}  spread=${fill['spread']:.4f}")
             print(f"      edge={sig.get('edge', 0)*100:.1f}%  "
                   f"conf={sig.get('confidence', 0)*100:.0f}%  "
@@ -377,20 +490,26 @@ class PaperTrader:
             self._open_trades_b[trade_id] = trade
 
 
-    def _check_exits(self, quote_map: Dict[float, dict],
+    def _get_quote(self, quote_map, strike, option_type='call'):
+        """Look up quote by (strike, type) tuple, falling back to strike-only."""
+        return quote_map.get((strike, option_type)) or quote_map.get(strike)
+
+    def _check_exits(self, quote_map: Dict,
                      ts_et: datetime, ts_utc: str):
-        """Check exit conditions for all open trades, both tracks."""
-        # Merge both track caches
+        """Check exit conditions for all open trades, all tracks."""
+        # Merge all track caches
         all_open = {
             **{tid: {**t, '_cache': '_a'} for tid, t in self._open_trades_a.items()},
             **{tid: {**t, '_cache': '_b'} for tid, t in self._open_trades_b.items()},
+            **{tid: {**t, '_cache': '_c'} for tid, t in self._open_trades_c.items()},
         }
 
         for trade_id, trade in list(all_open.items()):
             strike = trade['strike']
             action = trade['action']
             track = trade['track']
-            quote = quote_map.get(strike)
+            opt_type = trade.get('option_type', 'call')
+            quote = self._get_quote(quote_map, strike, opt_type)
 
             # Determine entry time
             entry_ts = datetime.fromisoformat(trade['entry_timestamp_utc'])
@@ -422,7 +541,7 @@ class PaperTrader:
 
                 quote_fresh = (quote_age is not None and quote_age <= max_age)
 
-                if track == 'decision_time':
+                if track == 'decision_time' or track == 'buy_only':
                     exit_reason = self._check_exit_a(
                         trade, exit_bid, exit_ask, hold_minutes, quote_fresh,
                         ts_et=ts_et, spot=spot_exit
@@ -582,6 +701,8 @@ class PaperTrader:
         track = trade['track']
         if track == 'decision_time':
             self._open_trades_a.pop(trade_id, None)
+        elif track == 'buy_only':
+            self._open_trades_c.pop(trade_id, None)
         else:
             self._open_trades_b.pop(trade_id, None)
 
@@ -593,9 +714,10 @@ class PaperTrader:
 
         # Console notification
         pnl_val = pnl_touch.get('net_pnl', 0)
-        tag = 'Track A' if track == 'decision_time' else 'Track B'
+        tag = {'decision_time': 'Track A', 'all_signals': 'Track B',
+               'buy_only': 'Track C'}.get(track, track)
         icon = 'WIN' if pnl_val > 0 else 'LOSS'
-        if track == 'decision_time':
+        if track in ('decision_time', 'buy_only'):
             print(f"\n  <<< PAPER TRADE CLOSED [{tag}] {icon} >>>")
             print(f"      {action} {strike} | {exit_reason} | "
                   f"PnL(touch) ${pnl_val:+.2f} | held {hold_minutes:.0f}min")
@@ -784,18 +906,28 @@ class PaperTrader:
 
         return round(mae, 6) if mae < 0 else None, round(mfe, 6) if mfe > 0 else None
 
-    def _record_quotes(self, quote_map: Dict[float, dict], spot: float,
+    def _record_quotes(self, quote_map: Dict, spot: float,
                        ts_utc: str):
-        """Record all current quotes to the tape."""
+        """Record all current quotes to the tape.
+        
+        Supports both tuple-key (strike, option_type) and
+        legacy strike-only key formats.
+        """
         quotes = []
-        for strike, q in quote_map.items():
+        for key, q in quote_map.items():
+            # Handle tuple key (strike, opt_type) or plain strike
+            if isinstance(key, tuple):
+                strike, opt_type = key
+            else:
+                strike = key
+                opt_type = q.get('option_type', 'call')
             bid = q.get('bid', 0)
             ask = q.get('ask', 0)
             mid = (bid + ask) / 2.0 if bid and ask else 0
             spread = ask - bid if bid and ask else 0
             quotes.append({
                 'strike': strike,
-                'option_type': q.get('option_type', 'call'),
+                'option_type': opt_type,
                 'bid': bid,
                 'ask': ask,
                 'mid': round(mid, 4),

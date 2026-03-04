@@ -84,4 +84,27 @@ PAPER_TRADING = {
         'exit_horizon_minutes': 5,
         'eod_exit_time': '15:55',
     },
+
+    # ── Track C: buy-only (calls + puts, no option selling) ──
+    'buy_only': {
+        'enabled': True,
+        'enter_on': 'decision_time',          # same cadence as Track A
+        'action_filter': 'BUY',               # reject all SELL signals
+        'option_types': ['call', 'put'],       # both directions
+        'max_open_positions': 3,
+        'max_trades_per_decision': 1,
+        'use_eu_scoring': True,
+        'use_regime_thresholds': True,
+        'selection_policy': 'eu_ranked',
+        'filters': {
+            'min_confidence': 0.50,
+            'min_edge': 0.02,
+            'max_spread_pct': 0.40,
+            'min_option_mid': 0.05,
+            'max_spot_age_seconds': 10,
+            'skip_bernoulli_violated': True,
+            'max_otm_dollars': 5.0,
+            'min_eu': 0.0,
+        },
+    },
 }

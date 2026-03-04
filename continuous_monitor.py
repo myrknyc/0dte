@@ -84,7 +84,7 @@ class ContinuousTradingMonitor:
                 self.last_calibration = datetime.now()
     
     def scan_strikes(self, strikes_to_check=5):
-        """Scan option strikes for signals"""
+        """Scan option strikes for call and put signals."""
         if not self.current_price:
             return
         
@@ -92,7 +92,7 @@ class ContinuousTradingMonitor:
         atm = round(self.current_price)
         strikes = [atm + i for i in range(-strikes_to_check//2, strikes_to_check//2 + 1)]
         
-        print(f"\n{datetime.now().strftime('%H:%M:%S')} - Scanning {len(strikes)} strikes...")
+        print(f"\n{datetime.now().strftime('%H:%M:%S')} - Scanning {len(strikes)} strikes (calls + puts)...")
         
         # Get option chain from provider
         try:
@@ -102,69 +102,91 @@ class ContinuousTradingMonitor:
                 return
             
             calls = chain.get('calls')
-            if calls is None or calls.empty:
-                return
+            puts = chain.get('puts')
             
             signals_found = []
             all_signals = []    # every signal, for paper trader
+            quote_map = {}      # (strike, option_type) → quote
             T = get_time_to_expiry()
             
-            for strike in strikes:
-                chain_row = calls[calls['strike'] == strike]
-                
-                if len(chain_row) == 0:
-                    continue
-                
-                row = chain_row.iloc[0]
-                
-                # Check calls — handle both yfinance and IBKR column names
-                bid_col = 'bid' if 'bid' in row.index else 'call_bid'
-                ask_col = 'ask' if 'ask' in row.index else 'call_ask'
-                if row[bid_col] > 0 and row[ask_col] > 0:
-                    mkt_iv = row.get('impliedVolatility', row.get('call_iv', None))
+            spot_age_val = (
+                (datetime.now() - self.trader.spot_timestamp).total_seconds()
+                if getattr(self.trader, 'spot_timestamp', None) else 0
+            )
+            
+            # Scan both calls and puts
+            chain_pairs = []
+            if calls is not None and not calls.empty:
+                chain_pairs.append(('call', calls))
+            if puts is not None and not puts.empty:
+                chain_pairs.append(('put', puts))
+            
+            for opt_type, chain_df in chain_pairs:
+                for strike in strikes:
+                    chain_row = chain_df[chain_df['strike'] == strike]
                     
-                    signal = self.trader.get_trading_signal(
-                        strike=strike,
-                        market_bid=row[bid_col],
-                        market_ask=row[ask_col],
-                        option_type='call',
-                        market_iv=mkt_iv
-                    )
+                    if len(chain_row) == 0:
+                        continue
                     
-                    # Log every signal
-                    spot_age = signal.get('spot_age_seconds', None)
-                    self.logger.log_signal(
-                        ticker=self.ticker,
-                        strike=strike,
-                        option_type='call',
-                        action=signal['action'],
-                        edge=signal['edge'],
-                        confidence=signal['confidence'],
-                        model_price=signal['model_price'],
-                        market_bid=row[bid_col],
-                        market_ask=row[ask_col],
-                        market_mid=signal['market_mid'],
-                        spread=signal['spread'],
-                        std_error=signal['std_error'],
-                        spot_price=self.current_price,
-                        time_to_expiry=T,
-                        iv=np.sqrt(self.trader.v0),
-                        n_paths=signal.get('n_paths'),
-                        vr_factor=signal.get('variance_reduction_factor'),
-                        reason=signal['reason'],
-                        source='continuous_monitor',
-                        market_iv=mkt_iv,
-                        spot_timestamp=self.trader.spot_timestamp,
-                        spot_age_seconds=spot_age,
-                    )
+                    row = chain_row.iloc[0]
                     
-                    if signal['action'] != 'HOLD' and signal['confidence'] > 0.6:
-                        signals_found.append({
-                            'strike': strike,
-                            'type': 'CALL',
-                            **signal
-                        })
-                    all_signals.append(signal)
+                    # Handle both yfinance and IBKR column names
+                    bid_col = 'bid' if 'bid' in row.index else f'{opt_type}_bid'
+                    ask_col = 'ask' if 'ask' in row.index else f'{opt_type}_ask'
+                    if row[bid_col] > 0 and row[ask_col] > 0:
+                        mkt_iv = row.get('impliedVolatility',
+                                         row.get(f'{opt_type}_iv', None))
+                        
+                        signal = self.trader.get_trading_signal(
+                            strike=strike,
+                            market_bid=row[bid_col],
+                            market_ask=row[ask_col],
+                            option_type=opt_type,
+                            market_iv=mkt_iv
+                        )
+                        
+                        # Log every signal
+                        spot_age = signal.get('spot_age_seconds', None)
+                        self.logger.log_signal(
+                            ticker=self.ticker,
+                            strike=strike,
+                            option_type=opt_type,
+                            action=signal['action'],
+                            edge=signal['edge'],
+                            confidence=signal['confidence'],
+                            model_price=signal['model_price'],
+                            market_bid=row[bid_col],
+                            market_ask=row[ask_col],
+                            market_mid=signal['market_mid'],
+                            spread=signal['spread'],
+                            std_error=signal['std_error'],
+                            spot_price=self.current_price,
+                            time_to_expiry=T,
+                            iv=np.sqrt(self.trader.v0),
+                            n_paths=signal.get('n_paths'),
+                            vr_factor=signal.get('variance_reduction_factor'),
+                            reason=signal['reason'],
+                            source='continuous_monitor',
+                            market_iv=mkt_iv,
+                            spot_timestamp=self.trader.spot_timestamp,
+                            spot_age_seconds=spot_age,
+                        )
+                        
+                        if signal['action'] != 'HOLD' and signal['confidence'] > 0.6:
+                            signals_found.append({
+                                'strike': strike,
+                                'type': opt_type.upper(),
+                                **signal
+                            })
+                        all_signals.append(signal)
+                        
+                        # Build quote map with tuple keys
+                        quote_map[(strike, opt_type)] = {
+                            'bid': float(row[bid_col]),
+                            'ask': float(row[ask_col]),
+                            'spot': self.current_price,
+                            'spot_age': spot_age_val,
+                        }
             
             # Display strong signals
             if signals_found:
@@ -180,23 +202,9 @@ class ContinuousTradingMonitor:
             
             # ── Paper trading hook ──
             if self.paper_trader and all_signals:
-                quote_map = {}
-                for strike in strikes:
-                    chain_row = calls[calls['strike'] == strike]
-                    if len(chain_row) == 0:
-                        continue
-                    r = chain_row.iloc[0]
-                    b_col = 'bid' if 'bid' in r.index else 'call_bid'
-                    a_col = 'ask' if 'ask' in r.index else 'call_ask'
-                    if r[b_col] > 0 and r[a_col] > 0:
-                        quote_map[strike] = {
-                            'bid': float(r[b_col]),
-                            'ask': float(r[a_col]),
-                            'spot': self.current_price,
-                            'spot_age': (datetime.now() - self.trader.spot_timestamp).total_seconds() if getattr(self.trader, 'spot_timestamp', None) else 0,
-                        }
                 self.paper_trader.on_scan(
-                    all_signals, quote_map, self.current_price, now_et()
+                    all_signals, quote_map, self.current_price, now_et(),
+                    trading_system=self.trader
                 )
             
         except Exception as e:
