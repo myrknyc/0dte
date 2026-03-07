@@ -46,6 +46,15 @@ _REGIME_THRESHOLDS = {
     'extreme':  {'min_edge': 0.050, 'min_confidence': 0.70, 'max_cvar_loss': -3.00, 'min_eu': 0.05},
 }
 
+# ── Regime-conditioned exit parameters (H4 extension) ────────
+# Wider TP/SL in volatile regimes to avoid noise stops on 0DTE.
+_REGIME_EXIT_PARAMS = {
+    'calm':     {'tp_pct': 0.15, 'sl_pct': 0.12},
+    'normal':   {'tp_pct': 0.20, 'sl_pct': 0.15},
+    'volatile': {'tp_pct': 0.30, 'sl_pct': 0.25},
+    'extreme':  {'tp_pct': 0.40, 'sl_pct': 0.35},
+}
+
 
 def get_adjusted_thresholds(regime: str) -> Dict[str, float]:
     """Return filter threshold overrides for the given regime.
@@ -54,6 +63,27 @@ def get_adjusted_thresholds(regime: str) -> Dict[str, float]:
     on top of the base filter config.
     """
     return dict(_REGIME_THRESHOLDS.get(regime, _REGIME_THRESHOLDS['normal']))
+
+
+def get_exit_params(regime: str,
+                    default_tp: float = 0.20,
+                    default_sl: float = 0.15) -> Dict[str, float]:
+    """Return regime-conditioned TP/SL percentages.
+
+    Falls back to caller-supplied defaults for unknown regimes.
+
+    Args:
+        regime: current regime string
+        default_tp: fallback take-profit percentage
+        default_sl: fallback stop-loss percentage
+
+    Returns:
+        {'tp_pct': float, 'sl_pct': float}
+    """
+    params = _REGIME_EXIT_PARAMS.get(regime)
+    if params:
+        return dict(params)
+    return {'tp_pct': default_tp, 'sl_pct': default_sl}
 
 
 # ── Regime-keyed jump priors (#5) ────────────────────────────

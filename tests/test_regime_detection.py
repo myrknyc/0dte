@@ -187,3 +187,35 @@ class TestPayoffDistributionStats:
         assert result['payoff_frac_pos'] <= 1.0
         assert result['payoff_mean_pos'] >= 0.0
         assert result['payoff_mean_zero'] >= 0.0
+
+
+class TestRegimeExitParams:
+    """Test regime-conditioned TP/SL exit parameters (H4 extension)."""
+
+    def test_calm_tighter_exits(self):
+        from calibration.regime_detector import get_exit_params
+        p = get_exit_params('calm')
+        assert p['tp_pct'] == 0.15
+        assert p['sl_pct'] == 0.12
+
+    def test_extreme_wider_exits(self):
+        from calibration.regime_detector import get_exit_params
+        p = get_exit_params('extreme')
+        assert p['tp_pct'] == 0.40
+        assert p['sl_pct'] == 0.35
+
+    def test_unknown_uses_defaults(self):
+        from calibration.regime_detector import get_exit_params
+        p = get_exit_params('unknown', default_tp=0.22, default_sl=0.18)
+        assert p['tp_pct'] == 0.22
+        assert p['sl_pct'] == 0.18
+
+    def test_tp_sl_monotonic_with_volatility(self):
+        """TP and SL should widen as regime volatility increases."""
+        from calibration.regime_detector import get_exit_params
+        regimes = ['calm', 'normal', 'volatile', 'extreme']
+        tps = [get_exit_params(r)['tp_pct'] for r in regimes]
+        sls = [get_exit_params(r)['sl_pct'] for r in regimes]
+        assert tps == sorted(tps), f"TP not monotonic: {tps}"
+        assert sls == sorted(sls), f"SL not monotonic: {sls}"
+

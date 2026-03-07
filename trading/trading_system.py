@@ -92,7 +92,18 @@ class TradingSystem:
             today_str = _dt.now().strftime('%Y-%m-%d')
             import yfinance as yf
             spy = yf.Ticker(self.ticker)
-            chain = spy.option_chain(today_str)
+            # Try today's date; fall back to nearest available expiration
+            try:
+                chain = spy.option_chain(today_str)
+            except Exception:
+                avail = spy.options
+                if avail:
+                    chain = spy.option_chain(avail[0])
+                    if verbose:
+                        print(f"\n  IV anchor: {today_str} not available, "
+                              f"using nearest expiry {avail[0]}")
+                else:
+                    raise ValueError("No option expirations available")
             calls = chain.calls
             atm_strike = round(self.S0)
             atm_row = calls[calls['strike'] == atm_strike]

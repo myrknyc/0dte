@@ -1,0 +1,77 @@
+============================= test session starts =============================
+platform win32 -- Python 3.13.3, pytest-9.0.2, pluggy-1.6.0 -- C:\Users\henry\AppData\Local\Programs\Python\Python313\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\henry\OneDrive\Desktop\PYTHON projects\0dte
+plugins: anyio-4.9.0
+collecting ... collected 1 item
+
+tests/test_paper_trading.py::TestTrackCDecisionGate::test_track_c_fires_at_same_decision_time_as_a FAILED [100%]
+
+================================== FAILURES ===================================
+____ TestTrackCDecisionGate.test_track_c_fires_at_same_decision_time_as_a _____
+
+self = <test_paper_trading.TestTrackCDecisionGate object at 0x000001BE79916C10>
+journal = <trading.paper_journal.PaperJournal object at 0x000001BE799374D0>
+config = {'all_signals': {'apply_filters': {'use_min_option_mid': False, 'use_spot_age': True, 'use_spread_pct': False}, 'coold...': True, 'dedup_policy': 'one_open_per_strike_type', ...}, 'commission_per_contract': 0.65, 'cooldown_minutes': 5, ...}
+
+    def test_track_c_fires_at_same_decision_time_as_a(self, journal, config):
+        """Track C should enter trades at the same decision time as Track A."""
+        import copy
+        cfg = copy.deepcopy(config)
+        cfg['decision_times'] = ['10:00']
+        cfg['buy_only'] = {
+            'enabled': True,
+            'enter_on': 'decision_time',
+            'action_filter': 'BUY',
+            'option_types': ['call', 'put'],
+            'max_open_positions': 3,
+            'max_trades_per_decision': 1,
+            'use_eu_scoring': False,
+            'use_regime_thresholds': False,
+            'selection_policy': 'risk_adjusted',
+            'dedup_policy': 'one_open_per_strike_type',
+            'cooldown_minutes': 0,
+            'filters': cfg.get('filters', {}),
+            'exit_mode': 'hybrid',
+            'tp_pct': 0.25,
+            'sl_pct': 0.20,
+            'exit_time_minutes': 30,
+            'eod_exit_time': '15:55',
+        }
+        trader = PaperTrader(journal=journal, config=cfg)
+    
+        # Two BUY signals at different strikes
+        sig_a = _make_signal(strike=590.0, action='BUY', edge=0.10, confidence=0.90)
+        sig_c = _make_signal(strike=591.0, action='BUY', edge=0.08, confidence=0.85)
+    
+        ts = datetime(2026, 2, 25, 10, 0, 0, tzinfo=_ET)
+        qm = _make_quote_map((590.0, 2.00, 2.20), (591.0, 1.90, 2.10))
+    
+        trader.on_scan([sig_a, sig_c], qm, 590.0, ts)
+    
+        # Both tracks should have entered
+        assert len(trader._open_trades_a) > 0, "Track A should have entered trades"
+>       assert len(trader._open_trades_c) > 0, "Track C should have entered trades (gate fix)"
+E       AssertionError: Track C should have entered trades (gate fix)
+E       assert 0 > 0
+E        +  where 0 = len({})
+E        +    where {} = <trading.paper_trader.PaperTrader object at 0x000001BE3A8F6A50>._open_trades_c
+
+tests\test_paper_trading.py:686: AssertionError
+---------------------------- Captured stdout call -----------------------------
+
+  >>> PAPER TRADE ENTERED [Track A] <<<
+      BUY CALL 590.0 @ mid=$2.1000  touch=$2.2000  spread=$0.2000
+      edge=10.0%  conf=90%  OTM=$1.0
+
+  >>> PAPER TRADE ENTERED [Track A] <<<
+      BUY CALL 591.0 @ mid=$2.1000  touch=$2.2000  spread=$0.2000
+      edge=8.0%  conf=85%  OTM=$1.0
+
+  [Paper] Decision @ 10:00 ET: 2 signals -> 2 eligible -> 2 entered | 2 open
+
+  [Paper] Track C Decision @ 10:00 ET: 2 signals -> 0 eligible -> 0 entered | 0 open
+           Rejections: cross_track_dup:2
+=========================== short test summary info ===========================
+FAILED tests/test_paper_trading.py::TestTrackCDecisionGate::test_track_c_fires_at_same_decision_time_as_a
+============================== 1 failed in 1.64s ==============================

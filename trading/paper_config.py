@@ -2,7 +2,7 @@ PAPER_TRADING = {
     # ══════════════════════════════════════════════════════════
     #  GLOBAL
     # ══════════════════════════════════════════════════════════
-    'tracks': ['decision_time', 'all_signals'],
+    'tracks': ['decision_time', 'all_signals', 'buy_only'],
     'timezone': 'America/New_York',
 
     # ── 3-tier fill model (shared by both tracks) ────────────
@@ -81,7 +81,8 @@ PAPER_TRADING = {
         'dedup_policy': 'one_open_per_strike_action',
         'cooldown_minutes': 0,            # if dedup_policy='cooldown'
         'exit_mode': 'fixed_horizon',     # fixed_horizon | eod
-        'exit_horizon_minutes': 5,
+        'exit_horizon_minutes': 10,
+        'max_loss_dollars': 60.0,           # absolute $ stop per contract
         'eod_exit_time': '15:55',
     },
 
@@ -96,15 +97,24 @@ PAPER_TRADING = {
         'use_eu_scoring': True,
         'use_regime_thresholds': True,
         'selection_policy': 'eu_ranked',
+        'dedup_policy': 'one_open_per_strike_type',
+        'cooldown_minutes': 15,
+        'cross_track_dedup': False,           # allow same strikes as Track A
         'filters': {
             'min_confidence': 0.50,
             'min_edge': 0.02,
-            'max_spread_pct': 0.40,
+            'max_spread_pct': 0.15,           # tightened (was 0.40) — wide spreads destroy edge on 0DTE
             'min_option_mid': 0.05,
             'max_spot_age_seconds': 10,
             'skip_bernoulli_violated': True,
             'max_otm_dollars': 5.0,
             'min_eu': 0.0,
         },
+        # Per-track exit config (overrides global when present)
+        'exit_mode': 'hybrid',
+        'tp_pct': 0.25,                      # slightly wider TP for buy-only (25%)
+        'sl_pct': 0.20,                       # wider SL (20%) — put gamma spikes sharper
+        'exit_time_minutes': 30,
+        'eod_exit_time': '15:55',
     },
 }

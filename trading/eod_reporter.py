@@ -43,7 +43,9 @@ class EODReporter:
         open_trades = self.journal.get_open_trades(run_id, track=track)
 
         print(f"\n{'─'*65}")
-        label = 'TRACK A: decision_time' if track == 'decision_time' else 'TRACK B: all_signals'
+        label = {'decision_time': 'TRACK A: decision_time',
+                 'all_signals': 'TRACK B: all_signals',
+                 'buy_only': 'TRACK C: buy_only'}.get(track, track)
         print(f"  {label}")
         print(f"{'─'*65}")
 
@@ -117,14 +119,16 @@ class EODReporter:
             self._print_by_moneyness(trades)
 
     def _print_by_decision_time(self, trades: List[dict]):
-        """PnL breakdown by decision time."""
+        """PnL breakdown by decision time (displayed in ET)."""
+        from zoneinfo import ZoneInfo
+        _ET = ZoneInfo('America/New_York')
         buckets: Dict[str, list] = {}
         for t in trades:
             ts = t.get('decision_timestamp_utc', '')
             if ts:
                 try:
                     dt = datetime.fromisoformat(ts)
-                    hhmm = dt.strftime('%H:%M')
+                    hhmm = dt.astimezone(_ET).strftime('%H:%M')
                 except (ValueError, TypeError):
                     hhmm = '??:??'
             else:
@@ -176,7 +180,7 @@ class EODReporter:
         print(f"  📋 SURVIVORSHIP FUNNEL")
         print(f"{'─'*65}")
 
-        for track in ['decision_time', 'all_signals']:
+        for track in ['decision_time', 'all_signals', 'buy_only']:
             track_rows = [dict(r) for r in rows if r['track'] == track]
             if not track_rows:
                 continue
@@ -186,7 +190,8 @@ class EODReporter:
             total_sel = sum(r.get('n_selected') or 0 for r in track_rows)
             total_ent = sum(r.get('n_entered') or 0 for r in track_rows)
 
-            label = 'Track A' if track == 'decision_time' else 'Track B'
+            label = {'decision_time': 'Track A', 'all_signals': 'Track B',
+                     'buy_only': 'Track C'}.get(track, track)
             print(f"\n  {label}: {len(track_rows)} decision points")
             print(f"    Signals seen  : {total_sig}")
             print(f"    Eligible      : {total_elig}")
@@ -300,7 +305,8 @@ class EODReporter:
         print(f"{'─'*65}")
 
         for track in tracks:
-            label = 'Track A' if track == 'decision_time' else 'Track B'
+            label = {'decision_time': 'Track A', 'all_signals': 'Track B',
+                     'buy_only': 'Track C'}.get(track, track)
             results = self.compute_forward_accuracy(run_id, track=track,
                                                     date_str=date_str)
             if not results:
@@ -363,9 +369,8 @@ class EODReporter:
     def print_backtest_metrics(self, run_id: str, track: str = None):
         """Print all four backtest metrics for a track."""
         m = BacktestMetrics(self.journal, run_id, track=track)
-        label = ('Track A' if track == 'decision_time'
-                 else 'Track B' if track == 'all_signals'
-                 else 'All Tracks')
+        label = {'decision_time': 'Track A', 'all_signals': 'Track B',
+                 'buy_only': 'Track C'}.get(track, 'All Tracks')
 
         # ── Per-Day Metrics ──
         pd = m.per_day_metrics()

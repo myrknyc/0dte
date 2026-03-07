@@ -61,25 +61,28 @@ class PaperTrader:
         # 1. Record quotes to tape (always, for forward eval)
         self._record_quotes(quote_map, spot, ts_utc)
 
+        # Pre-compute decision-time flag ONCE (fire-once gate shared by all tracks)
+        is_dt = self._is_decision_time(timestamp_et)
+
         # 2. Track A: decision_time
-        if self._is_decision_time(timestamp_et):
+        if is_dt:
             self._make_decision_a(signals, quote_map, spot, timestamp_et, ts_utc)
 
         # 3. Track B: all_signals
         b_cfg = self.cfg.get('all_signals', {})
         if b_cfg.get('enabled', False):
             enter_on = b_cfg.get('enter_on', 'every_scan')
-            if enter_on == 'every_scan' or self._is_decision_time(timestamp_et):
+            if enter_on == 'every_scan' or is_dt:
                 self._enter_all_signals_b(signals, quote_map, spot, timestamp_et, ts_utc)
 
         # 4. Track C: buy_only
         c_cfg = self.cfg.get('buy_only', {})
         if c_cfg.get('enabled', False):
             enter_on = c_cfg.get('enter_on', 'decision_time')
-            if enter_on == 'every_scan' or self._is_decision_time(timestamp_et):
+            if enter_on == 'every_scan' or is_dt:
                 self._make_decision_c(signals, quote_map, spot, timestamp_et, ts_utc)
 
-        # 4. Check exits for both tracks
+        # 5. Check exits for all tracks
         self._check_exits(quote_map, timestamp_et, ts_utc)
 
     
@@ -323,10 +326,11 @@ class PaperTrader:
 
     def _make_decision_c(self, signals: List[dict], quote_map: Dict,
                          spot: float, ts_et: datetime, ts_utc: str):
-        """Filter → rank → select → enter for Track C (buy-only).
-        
+        """Filter → dedup → rank → select → enter for Track C (buy-only).
+
         Only BUY signals are accepted. Calls and puts both allowed.
         Uses Track C-specific config for thresholds, limits, and policy.
+        Cross-track awareness: skips strikes already open in Track A.
         """
         track = 'buy_only'
         c_cfg = self.cfg.get('buy_only', {})
@@ -343,11 +347,22 @@ class PaperTrader:
             regime_overrides = get_adjusted_thresholds(self._current_regime)
             c_filters.update(regime_overrides)
 
+        # Pre-compute open strikes (Track C dedup + cross-track awareness)
+        open_c_strikes = {
+            (t['strike'], t.get('option_type', 'call'))
+            for t in self._open_trades_c.values()
+        }
+        open_a_strikes = {
+            (t['strike'], t.get('option_type', 'call'))
+            for t in self._open_trades_a.values()
+        }
+
         # Filter
         allowed_types = c_cfg.get('option_types', ['call', 'put'])
         for sig in signals:
             action = sig.get('action', 'HOLD')
             opt_type = sig.get('option_type', 'call')
+            strike = sig.get('strike')
 
             # Track C: BUY only
             if action != 'BUY':
@@ -357,6 +372,16 @@ class PaperTrader:
             # Option type filter
             if opt_type not in allowed_types:
                 rejections['wrong_type'] = rejections.get('wrong_type', 0) + 1
+                continue
+
+            # Dedup: skip if Track C already has this (strike, type) open
+            if (strike, opt_type) in open_c_strikes:
+                rejections['dedup_open'] = rejections.get('dedup_open', 0) + 1
+                continue
+
+            # Cross-track: skip if Track A already holds same (strike, type)
+            if (strike, opt_type) in open_a_strikes:
+                rejections['cross_track_dup'] = rejections.get('cross_track_dup', 0) + 1
                 continue
 
             # Apply standard eligibility with Track C filters
@@ -370,19 +395,16 @@ class PaperTrader:
         # Diversify
         eligible = self._diversify(eligible)
 
-        # Rank (using Track C policy)
-        c_policy = c_cfg.get('selection_policy', self.cfg.get('selection_policy', 'eu_ranked'))
-        old_policy = self.cfg.get('selection_policy')
-        self.cfg['selection_policy'] = c_policy
-        ranked = self._rank_signals(eligible)
-        self.cfg['selection_policy'] = old_policy  # restore
+        # Rank (using Track C policy — passed explicitly, no cfg mutation)
+        c_policy = c_cfg.get('selection_policy',
+                             self.cfg.get('selection_policy', 'eu_ranked'))
+        ranked = self._rank_signals(eligible, policy_override=c_policy)
 
-        # Select top-N
+        # Select top-N respecting position limits
         max_trades = c_cfg.get('max_trades_per_decision', 1)
         max_open = c_cfg.get('max_open_positions', 3)
-        current_open = len(self._open_trades_c)
-        slots = min(max_trades, max_open - current_open)
-        selected = ranked[:max(0, slots)]
+        slots = max(0, min(max_trades, max_open - len(self._open_trades_c)))
+        selected = ranked[:slots]
 
         # Enter
         n_entered = 0
@@ -400,7 +422,8 @@ class PaperTrader:
               f"{len(signals)} signals -> {len(eligible)} eligible -> "
               f"{n_entered} entered | {len(self._open_trades_c)} open")
         if rejections:
-            rej_str = ', '.join(f'{k}:{v}' for k, v in sorted(rejections.items(), key=lambda x: -x[1]))
+            rej_str = ', '.join(f'{k}:{v}' for k, v in sorted(
+                rejections.items(), key=lambda x: -x[1]))
             print(f"           Rejections: {rej_str}")
 
         # Snapshot
@@ -409,7 +432,8 @@ class PaperTrader:
             spot_price=spot, n_signals=len(signals),
             n_eligible=len(eligible), n_selected=len(selected),
             n_entered=n_entered, rejection_breakdown=rejections,
-            signals_json=json.dumps([_signal_summary(s) for s in signals], default=str),
+            signals_json=json.dumps(
+                [_signal_summary(s) for s in signals], default=str),
             intraday_move_pct=self._intraday_move_pct,
             regime=self._current_regime,
         )
@@ -528,9 +552,13 @@ class PaperTrader:
             spot_exit = None
 
             # ── EOD exit (clock-based, always checked) ──
-            eod_str = (self.cfg['all_signals']['eod_exit_time']
-                       if track == 'all_signals'
-                       else self.cfg.get('eod_exit_time', '15:55'))
+            if track == 'all_signals':
+                eod_str = self.cfg['all_signals']['eod_exit_time']
+            elif track == 'buy_only':
+                eod_str = self.cfg.get('buy_only', {}).get('eod_exit_time',
+                          self.cfg.get('eod_exit_time', '15:55'))
+            else:
+                eod_str = self.cfg.get('eod_exit_time', '15:55')
             eod_h, eod_m = int(eod_str.split(':')[0]), int(eod_str.split(':')[1])
             if ts_et.hour > eod_h or (ts_et.hour == eod_h and ts_et.minute >= eod_m):
                 exit_reason = 'eod_exit'
@@ -546,12 +574,16 @@ class PaperTrader:
                 quote_fresh = (quote_age is not None and quote_age <= max_age)
 
                 if track == 'decision_time' or track == 'buy_only':
+                    # Resolve per-track exit config
+                    t_cfg = (self.cfg.get('buy_only', {})
+                             if track == 'buy_only' else self.cfg)
                     exit_reason = self._check_exit_a(
                         trade, exit_bid, exit_ask, hold_minutes, quote_fresh,
-                        ts_et=ts_et, spot=spot_exit
+                        ts_et=ts_et, spot=spot_exit, track_cfg=t_cfg
                     )
                 else:
-                    exit_reason = self._check_exit_b(trade, hold_minutes)
+                    exit_reason = self._check_exit_b(
+                        trade, hold_minutes, exit_bid, exit_ask)
 
             elif not quote and not exit_reason:
                 # No quote available — skip price-based exits
@@ -563,9 +595,11 @@ class PaperTrader:
 
     def _check_exit_a(self, trade: dict, bid: float, ask: float,
                       hold_minutes: float, quote_fresh: bool,
-                      ts_et: datetime = None, spot: float = None) -> Optional[str]:
-        """Track A exit: hybrid (TP/SL/theta_decay/time/EOD)."""
-        mode = self.cfg.get('exit_mode', 'hybrid')
+                      ts_et: datetime = None, spot: float = None,
+                      track_cfg: dict = None) -> Optional[str]:
+        """Track A/C exit: hybrid (TP/SL/theta_decay/time/EOD)."""
+        cfg = track_cfg or self.cfg
+        mode = cfg.get('exit_mode', self.cfg.get('exit_mode', 'hybrid'))
         mid = (bid + ask) / 2.0
 
         entry_fill = trade['entry_fill']
@@ -583,8 +617,22 @@ class PaperTrader:
 
         # TP/SL (only if quote is fresh)
         if quote_fresh and mode in ('tp_sl', 'hybrid'):
-            tp = self.cfg.get('tp_pct', 0.20)
-            sl = self.cfg.get('sl_pct', 0.15)
+            # H4 extension: regime-conditioned TP/SL
+            base_tp = cfg.get('tp_pct', self.cfg.get('tp_pct', 0.20))
+            base_sl = cfg.get('sl_pct', self.cfg.get('sl_pct', 0.15))
+
+            if self.cfg.get('use_regime_thresholds', False):
+                from calibration.regime_detector import get_exit_params
+                regime_exits = get_exit_params(
+                    self._current_regime,
+                    default_tp=base_tp, default_sl=base_sl
+                )
+                tp = regime_exits['tp_pct']
+                sl = regime_exits['sl_pct']
+            else:
+                tp = base_tp
+                sl = base_sl
+
             if unrealized_pct >= tp:
                 return 'take_profit'
             if unrealized_pct <= -sl:
@@ -638,19 +686,35 @@ class PaperTrader:
 
         # Time exit
         if mode in ('time', 'hybrid'):
-            max_mins = self.cfg.get('exit_time_minutes', 30)
+            max_mins = cfg.get('exit_time_minutes',
+                               self.cfg.get('exit_time_minutes', 30))
             if hold_minutes >= max_mins:
                 return 'time_exit'
 
         return None
 
-    def _check_exit_b(self, trade: dict, hold_minutes: float) -> Optional[str]:
-        """Track B exit: fixed_horizon or eod."""
+    def _check_exit_b(self, trade: dict, hold_minutes: float,
+                      bid: float = None, ask: float = None) -> Optional[str]:
+        """Track B exit: fixed_horizon, absolute_stop, or eod."""
         b_cfg = self.cfg.get('all_signals', {})
         mode = b_cfg.get('exit_mode', 'fixed_horizon')
 
+        # Absolute dollar stop-loss (per contract, checked before horizon)
+        max_loss = b_cfg.get('max_loss_dollars')
+        if max_loss is not None and bid is not None and ask is not None:
+            entry_mid = trade['entry_fill'].get('mid', 0)
+            mid = (bid + ask) / 2.0
+            action = trade['action']
+            if entry_mid > 0:
+                if action == 'BUY':
+                    unrealized_dollar = (entry_mid - mid) * 100  # loss is positive
+                else:
+                    unrealized_dollar = (mid - entry_mid) * 100
+                if unrealized_dollar >= max_loss:
+                    return 'absolute_stop'
+
         if mode == 'fixed_horizon':
-            horizon = b_cfg.get('exit_horizon_minutes', 5)
+            horizon = b_cfg.get('exit_horizon_minutes', 10)
             if hold_minutes >= horizon:
                 return 'fixed_horizon'
 
@@ -746,9 +810,10 @@ class PaperTrader:
 
         return False
 
-    def _rank_signals(self, signals: List[dict]) -> List[dict]:
+    def _rank_signals(self, signals: List[dict],
+                      policy_override: str = None) -> List[dict]:
         """Rank signals by the configured selection policy."""
-        policy = self.cfg.get('selection_policy', 'risk_adjusted')
+        policy = policy_override or self.cfg.get('selection_policy', 'risk_adjusted')
         spread_floor = self.cfg.get('spread_floor', 0.01)
 
         def _score(s):

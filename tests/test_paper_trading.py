@@ -638,3 +638,125 @@ class TestSchema:
         ver = j.conn.execute("PRAGMA user_version").fetchone()[0]
         assert ver == 2
         j.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Track C Decision Gate (P0 fix)
+# ═══════════════════════════════════════════════════════════════
+
+class TestTrackCDecisionGate:
+
+    def test_track_c_fires_at_same_decision_time_as_a(self, journal, config):
+        """Track C should enter trades at the same decision time as Track A."""
+        import copy
+        cfg = copy.deepcopy(config)
+        cfg['decision_times'] = ['10:00']
+        cfg['max_trades_per_decision'] = 1  # Track A takes only 1
+        cfg['buy_only'] = {
+            'enabled': True,
+            'enter_on': 'decision_time',
+            'action_filter': 'BUY',
+            'option_types': ['call', 'put'],
+            'max_open_positions': 3,
+            'max_trades_per_decision': 1,
+            'use_eu_scoring': False,
+            'use_regime_thresholds': False,
+            'selection_policy': 'risk_adjusted',
+            'dedup_policy': 'one_open_per_strike_type',
+            'cooldown_minutes': 0,
+            'cross_track_dedup': True,
+            'filters': cfg.get('filters', {}),
+            'exit_mode': 'hybrid',
+            'tp_pct': 0.25,
+            'sl_pct': 0.20,
+            'exit_time_minutes': 30,
+            'eod_exit_time': '15:55',
+        }
+        trader = PaperTrader(journal=journal, config=cfg)
+
+        # Three BUY signals at DIFFERENT strikes
+        # Track A takes top-1 (590), Track C should pick from 591 or 592
+        sig1 = _make_signal(strike=590.0, action='BUY', edge=0.10, confidence=0.90)
+        sig2 = _make_signal(strike=591.0, action='BUY', edge=0.08, confidence=0.85)
+        sig3 = _make_signal(strike=592.0, action='BUY', edge=0.06, confidence=0.80)
+
+        ts = datetime(2026, 2, 25, 10, 0, 0, tzinfo=_ET)
+        qm = _make_quote_map((590.0, 2.00, 2.20), (591.0, 1.90, 2.10),
+                             (592.0, 1.80, 2.00))
+
+        trader.on_scan([sig1, sig2, sig3], qm, 590.0, ts)
+
+        # Both tracks should have entered
+        assert len(trader._open_trades_a) > 0, "Track A should have entered trades"
+        assert len(trader._open_trades_c) > 0, "Track C should have entered trades (gate fix)"
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Track B Absolute Stop (P2 improvement)
+# ═══════════════════════════════════════════════════════════════
+
+class TestTrackBAbsoluteStop:
+
+    def test_absolute_stop_triggers(self, journal, config):
+        """Track B closes when unrealized loss exceeds max_loss_dollars."""
+        config['all_signals']['max_loss_dollars'] = 60.0
+        trader = PaperTrader(journal=journal, config=config)
+
+        sig = _make_signal(strike=590.0, action='BUY', bid=2.00, ask=2.20, spot_age=2)
+        entry_ts = datetime(2026, 2, 25, 10, 0, 0, tzinfo=_ET)
+        trader._enter_trade(sig, 590.0, to_utc_str(entry_ts), 'all_signals')
+        assert len(trader._open_trades_b) == 1
+
+        # Entry mid = 2.10; loss of $60 per contract → mid needs to drop
+        # to 2.10 - 0.60 = 1.50  (0.60 × 100 = $60)
+        exit_ts = entry_ts + timedelta(minutes=2)
+        qm = _make_quote_map((590.0, 1.40, 1.60))  # mid = 1.50 → loss = $60
+        trader._check_exits(qm, exit_ts, to_utc_str(exit_ts))
+        assert len(trader._open_trades_b) == 0, "Absolute stop should have closed the trade"
+
+    def test_absolute_stop_does_not_fire_below_threshold(self, journal, config):
+        """Trade stays open when loss is below max_loss_dollars."""
+        config['all_signals']['max_loss_dollars'] = 60.0
+        config['all_signals']['exit_horizon_minutes'] = 30  # long horizon
+        trader = PaperTrader(journal=journal, config=config)
+
+        sig = _make_signal(strike=590.0, action='BUY', bid=2.00, ask=2.20, spot_age=2)
+        entry_ts = datetime(2026, 2, 25, 10, 0, 0, tzinfo=_ET)
+        trader._enter_trade(sig, 590.0, to_utc_str(entry_ts), 'all_signals')
+
+        # Entry mid = 2.10; loss of $40 → below threshold
+        exit_ts = entry_ts + timedelta(minutes=2)
+        qm = _make_quote_map((590.0, 1.60, 1.80))  # mid = 1.70 → loss = $40
+        trader._check_exits(qm, exit_ts, to_utc_str(exit_ts))
+        assert len(trader._open_trades_b) == 1, "Trade should stay open (loss below cap)"
+
+
+# ═══════════════════════════════════════════════════════════════
+#  EOD Reporter Decision Time Display (ET fix)
+# ═══════════════════════════════════════════════════════════════
+
+class TestDecisionTimeDisplay:
+
+    def test_decision_time_shows_et_not_utc(self, journal, config, capsys):
+        """Decision time breakdown should display ET, not UTC."""
+        run_id = journal.start_run(config)
+        ts_utc = '2026-02-25T15:00:00+00:00'  # 15:00 UTC = 10:00 ET
+
+        sig = _make_signal(strike=590.0, action='BUY')
+        fill = {'mid': 2.10, 'touch': 2.20, 'slippage': 2.22, 'spread': 0.20}
+        tid = journal.open_trade(run_id, 'decision_time', sig, fill,
+                                 590.0, ts_utc, entry_fees=0.70,
+                                 decision_timestamp_utc=ts_utc)
+        pnl = {'gross_pnl': 30.0, 'net_pnl': 28.60, 'return_pct': 0.14}
+        exit_fill = {'mid': 2.40, 'touch': 2.30, 'slippage': 2.28}
+        journal.close_trade(tid, 2.30, 2.50, exit_fill, 591.0, ts_utc,
+                            'time_exit', pnl, pnl, pnl, 5.0, exit_fees=0.70)
+
+        reporter = EODReporter(journal, config)
+        trades = journal.get_all_trades(run_id, track='decision_time')
+        reporter._print_by_decision_time(trades)
+
+        output = capsys.readouterr().out
+        assert '10:00' in output, f"Should show 10:00 ET, got: {output}"
+        assert '15:00' not in output, f"Should NOT show 15:00 UTC, got: {output}"
+

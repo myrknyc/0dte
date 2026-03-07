@@ -41,8 +41,12 @@ def _heston_cf(u, S0, K, T, r, kappa, theta_v, sigma_v, rho, v0):
     exp_neg_dT = np.exp(-d * T)
 
     # C and D coefficients
+    # Guard: clamp log argument away from zero to prevent NaN
+    log_arg = (1.0 - g * exp_neg_dT) / (1.0 - g)
+    if abs(log_arg) < 1e-30:
+        log_arg = 1e-30
     C = (kappa * theta_v / (sigma_v ** 2)) * (
-        g_num * T - 2.0 * np.log((1.0 - g * exp_neg_dT) / (1.0 - g))
+        g_num * T - 2.0 * np.log(log_arg)
     )
 
     D = (g_num / (sigma_v ** 2)) * (
@@ -71,6 +75,9 @@ def _integrand_P(u, j, S0, K, T, r, kappa, theta_v, sigma_v, rho, v0):
         cf_val = _heston_cf(u, S0, K, T, r, kappa, theta_v, sigma_v, rho, v0)
 
     integrand = np.real(np.exp(-iu * np.log(K)) * cf_val / (iu))
+    # Guard: return 0 if integrand is NaN/Inf (common with extreme params)
+    if not np.isfinite(integrand):
+        return 0.0
     return integrand
 
 
@@ -102,8 +109,8 @@ def heston_cf_price(S, K, T, r, kappa, theta_v, sigma_v, rho, v0,
             return max(K - S, 0.0)
 
     # Adaptive integration upper bound: CF decays faster for short T
-    # For T~30min (0.0002yr), 50/sqrt(T) ≈ 3500 — overkill, so cap at 500
-    u_max = min(500.0, max(50.0, 50.0 / np.sqrt(T)))
+    # Cap at 200 to prevent oscillatory integrands from stalling quad
+    u_max = min(200.0, max(50.0, 50.0 / np.sqrt(T)))
 
     # Gil-Pelaez: P_j = 0.5 + (1/π) ∫₀^∞ Re[...] du
     args = (S, K, T, r, kappa, theta_v, sigma_v, rho, v0)
@@ -112,9 +119,16 @@ def heston_cf_price(S, K, T, r, kappa, theta_v, sigma_v, rho, v0,
         warnings.simplefilter("ignore")
 
         int1, _ = quad(lambda u: _integrand_P(u, 1, *args),
-                       1e-8, u_max, limit=300)
+                       1e-8, u_max, limit=200)
         int2, _ = quad(lambda u: _integrand_P(u, 2, *args),
-                       1e-8, u_max, limit=300)
+                       1e-8, u_max, limit=200)
+
+    # Guard: if integrals returned NaN, fall back to intrinsic
+    if not (np.isfinite(int1) and np.isfinite(int2)):
+        if option_type == 'call':
+            return max(S - K * np.exp(-r * T), 0.0)
+        else:
+            return max(K * np.exp(-r * T) - S, 0.0)
 
     P1 = 0.5 + int1 / np.pi
     P2 = 0.5 + int2 / np.pi
@@ -223,6 +237,10 @@ def calibrate_to_iv_surface(option_chain, S0, T, r=RISK_FREE_RATE,
                 S0, strikes, T, r, kappa, theta_v, sigma_v, rho, v0, 'call'
             )
         except Exception:
+            return 1e6
+
+        # Guard: if any model price is NaN/Inf, reject this parameter set
+        if not np.all(np.isfinite(model_prices)):
             return 1e6
 
         residuals = (model_prices - market_prices) ** 2
