@@ -1,3 +1,7 @@
+"""DEPRECATED: This module is unused — paper_trader.py implements its own
+exit logic (TP/SL/theta_decay/time/EOD).  Kept for reference only.
+Remove once paper trader exit logic is fully validated."""
+
 from datetime import datetime, time
 from typing import Dict, List, Optional
 from config import RISK_DEFAULTS

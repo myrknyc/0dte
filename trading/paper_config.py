@@ -29,6 +29,8 @@ PAPER_TRADING = {
     'cooldown_minutes': 15,
     'cooldown_scope': 'same_direction',   # same_direction | any_direction
     'min_strike_spacing': 1.0,            # $ apart minimum
+    'allowed_actions': ['BUY'],           # P1: disable SELL until n≥50 validates in Track B
+    'max_entries_per_strike': 2,          # P1: max same-strike entries per session
 
     'filters': {
         'min_edge': 0.02,
@@ -36,6 +38,7 @@ PAPER_TRADING = {
         'max_spread_pct': 0.10,
         'min_option_mid': 0.05,
         'max_option_mid': None,           # no cap
+        'min_model_price': 0.10,          # Q4: reject sub-dime model prices (MC noise dominates)
         'max_spot_age_seconds': 10,
         'skip_bernoulli_violated': True,
         'max_otm_dollars': 5.0,
@@ -57,9 +60,9 @@ PAPER_TRADING = {
     'fixed_dollar_risk': 100.0,
 
     'exit_mode': 'hybrid',                # time | tp_sl | eod | hybrid
-    'exit_time_minutes': 30,
-    'tp_pct': 0.20,                       # +20%
-    'sl_pct': 0.15,                       # -15%
+    'exit_time_minutes': 45,              # P1: extended from 30 — accuracy peaks at 30-60 min
+    'tp_pct': 0.30,                       # P1: widened from 0.20 — let winners run
+    'sl_pct': 0.20,                       # P1: widened from 0.15 — reduce noise stops
     'eod_exit_time': '15:55',
 
     'greeks_exit': {
@@ -105,6 +108,7 @@ PAPER_TRADING = {
             'min_edge': 0.02,
             'max_spread_pct': 0.15,           # tightened (was 0.40) — wide spreads destroy edge on 0DTE
             'min_option_mid': 0.05,
+            'min_model_price': 0.10,          # Q4: reject sub-dime model prices
             'max_spot_age_seconds': 10,
             'skip_bernoulli_violated': True,
             'max_otm_dollars': 5.0,

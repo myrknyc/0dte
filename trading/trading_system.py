@@ -1,6 +1,8 @@
 import numpy as np
 from datetime import datetime
 
+from core.clock import now_utc, now_et
+
 from config import (
     DEFAULT_PARAMS, RISK_FREE_RATE, N_PATHS_DEFAULT, N_STEPS_0DTE,
     TRADING_DAYS_PER_YEAR, get_time_to_expiry, USE_ANTITHETIC,
@@ -14,6 +16,7 @@ from core.random_numbers import generate_correlated_normals
 from models.combined_model import simulate_combined_paths_fast as simulate_combined_paths
 from models.jump_diffusion import validate_bernoulli_approximation
 from pricing.european import price_european_option
+from pricing.greeks import compute_pathwise_delta
 from calibration.heston_calibrator import calibrate_to_realized_vol
 from calibration.jump_calibrator import calibrate_from_returns
 from calibration.mean_reversion_calibrator import calibrate_from_intraday
@@ -88,40 +91,28 @@ class TradingSystem:
         
         # 5b. IV anchor: floor v0 at ATM implied vol from option chain
         try:
-            from datetime import datetime as _dt
-            today_str = _dt.now().strftime('%Y-%m-%d')
-            import yfinance as yf
-            spy = yf.Ticker(self.ticker)
-            # Try today's date; fall back to nearest available expiration
-            try:
-                chain = spy.option_chain(today_str)
-            except Exception:
-                avail = spy.options
-                if avail:
-                    chain = spy.option_chain(avail[0])
-                    if verbose:
-                        print(f"\n  IV anchor: {today_str} not available, "
-                              f"using nearest expiry {avail[0]}")
-                else:
-                    raise ValueError("No option expirations available")
-            calls = chain.calls
-            atm_strike = round(self.S0)
-            atm_row = calls[calls['strike'] == atm_strike]
-            if len(atm_row) > 0 and 'impliedVolatility' in atm_row.columns:
-                iv_atm = atm_row['impliedVolatility'].values[0]
-                # Validate IV is finite and plausible for SPY 0DTE
-                if np.isfinite(iv_atm) and 0.05 <= iv_atm <= 2.0:
-                    iv_var = iv_atm ** 2
-                    if iv_var > self.v0:
-                        if verbose:
-                            print(f"\n  IV anchor: ATM IV={iv_atm:.2%}, v0 calibrated={np.sqrt(self.v0):.2%}")
-                            print(f"  → Overriding v0: {np.sqrt(self.v0):.2%} → {iv_atm:.2%}")
-                        self.v0 = iv_var
-                        self.params['v0'] = iv_var
+            today_str = now_et().strftime('%Y-%m-%d')
+            chain_data = self.provider.get_option_chain(self.ticker, expiry_date=today_str)
+            calls = chain_data.get('calls')
+            if calls is not None and not calls.empty:
+                atm_strike = round(self.S0)
+                atm_row = calls[calls['strike'] == atm_strike]
+                iv_col = 'impliedVolatility' if 'impliedVolatility' in calls.columns else None
+                if iv_col and len(atm_row) > 0:
+                    iv_atm = atm_row[iv_col].values[0]
+                    # Validate IV is finite and plausible for SPY 0DTE
+                    if np.isfinite(iv_atm) and 0.05 <= iv_atm <= 2.0:
+                        iv_var = iv_atm ** 2
+                        if iv_var > self.v0:
+                            if verbose:
+                                print(f"\n  IV anchor: ATM IV={iv_atm:.2%}, v0 calibrated={np.sqrt(self.v0):.2%}")
+                                print(f"  → Overriding v0: {np.sqrt(self.v0):.2%} → {iv_atm:.2%}")
+                            self.v0 = iv_var
+                            self.params['v0'] = iv_var
+                        elif verbose:
+                            print(f"\n  IV anchor: ATM IV={iv_atm:.2%}, v0={np.sqrt(self.v0):.2%} (OK, no override)")
                     elif verbose:
-                        print(f"\n  IV anchor: ATM IV={iv_atm:.2%}, v0={np.sqrt(self.v0):.2%} (OK, no override)")
-                elif verbose:
-                    print(f"\n  IV anchor: ATM IV={iv_atm} out of range [5%-200%]. Ignoring.")
+                        print(f"\n  IV anchor: ATM IV={iv_atm} out of range [5%-200%]. Ignoring.")
         except Exception as e:
             if verbose:
                 print(f"\n  IV anchor: Could not fetch ATM IV ({e}). Using calibrated v0.")
@@ -132,8 +123,7 @@ class TradingSystem:
             try:
                 from calibration.heston_cf import calibrate_to_iv_surface
                 T_now = get_time_to_expiry()
-                from datetime import datetime as _dt2
-                today_str2 = _dt2.now().strftime('%Y-%m-%d')
+                today_str2 = now_et().strftime('%Y-%m-%d')
                 chain_data = self.provider.get_option_chain(self.ticker, expiry_date=today_str2)
                 calls_df = chain_data['calls']
                 
@@ -590,9 +580,8 @@ class TradingSystem:
     def get_trading_signal(self, strike, market_bid, market_ask, option_type='call',
                            market_iv=None):
         # ── Spot freshness gate ──────────────────────────────────
-        from datetime import datetime as _dt
         if self.spot_timestamp is not None:
-            spot_age = (_dt.now() - self.spot_timestamp).total_seconds()
+            spot_age = (now_utc() - self.spot_timestamp).total_seconds()
         else:
             spot_age = float('inf')  # unknown age → treat as stale
 
@@ -628,6 +617,23 @@ class TradingSystem:
         result = self.price_option(strike, option_type=option_type, market_iv=market_iv)
         model_price = result['price']
         std_error = result['std_error']
+
+        # Q6: compute pathwise delta from the MC paths used for pricing
+        # NOTE (Q2): All strikes in a single scan share the same cached MC
+        # paths (_cached_paths). This means entry decisions across strikes are
+        # NOT independent — a bullish MC draw fires all call signals at once.
+        # For Track A/C (limited entries) diversification mitigates this.
+        # For Track B, consider alternating path seeds between strikes.
+        delta = None
+        delta_se = None
+        if self._cached_paths is not None:
+            try:
+                S_paths = self._cached_paths['S_paths']
+                delta, delta_se = compute_pathwise_delta(
+                    S_paths, self.S0, strike, T, r, option_type
+                )
+            except Exception:
+                pass  # non-critical — signal works without delta
         
         # Market mid price and spread
         market_mid = (market_bid + market_ask) / 2
@@ -790,6 +796,8 @@ class TradingSystem:
             'rho': self.params.get('rho'),
             'calibration_flags': result.get('calibration_flags'),
             'otm_dollars': otm_dollars,
+            'delta': delta,
+            'delta_se': delta_se,
         }
 
     def update_spot(self):

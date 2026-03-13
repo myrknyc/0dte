@@ -4,10 +4,11 @@ from datetime import datetime, time as dt_time
 from typing import Dict
 import threading
 
+from core.clock import now_et, now_utc, is_market_open, ET
 from data.data_provider import MarketDataProvider, select_provider, IBKRProvider
 from trading.trading_system import TradingSystem
 from trading.paper_trader import PaperTrader
-from trading.paper_journal import PaperJournal, now_et
+from trading.paper_journal import PaperJournal
 from trading.eod_reporter import EODReporter
 from signals.signal_logger import SignalLogger
 from calibration.heston_calibrator import calibrate_heston_live
@@ -60,13 +61,13 @@ class ContinuousTradingMonitor:
         # Initial calibration (uses provider automatically)
         print("\nPerforming initial calibration...")
         self.trader.calibrate_to_market()
-        self.last_calibration = datetime.now()
+        self.last_calibration = now_utc()
         
         return True
     
     def _on_price_update(self, symbol, data):
         self.current_price = data['last']
-        self._price_timestamp = datetime.now()
+        self._price_timestamp = now_utc()
         
         # Update trader's current price + timestamp
         self.trader.S0 = self.current_price
@@ -74,14 +75,14 @@ class ContinuousTradingMonitor:
         
         # Check if recalibration needed
         if self.last_calibration:
-            minutes_since = (datetime.now() - self.last_calibration).seconds / 60
+            minutes_since = (now_utc() - self.last_calibration).total_seconds() / 60
             
             if minutes_since >= self.recalibrate_minutes:
                 print(f"\n{'='*60}")
                 print(f"Auto-recalibrating ({self.recalibrate_minutes} min elapsed)")
                 print(f"{'='*60}")
                 self.trader.calibrate_to_market()
-                self.last_calibration = datetime.now()
+                self.last_calibration = now_utc()
     
     def scan_strikes(self, strikes_to_check=5):
         """Scan option strikes for call and put signals."""
@@ -92,7 +93,7 @@ class ContinuousTradingMonitor:
         atm = round(self.current_price)
         strikes = [atm + i for i in range(-strikes_to_check//2, strikes_to_check//2 + 1)]
         
-        print(f"\n{datetime.now().strftime('%H:%M:%S')} - Scanning {len(strikes)} strikes (calls + puts)...")
+        print(f"\n{now_et().strftime('%H:%M:%S')} ET - Scanning {len(strikes)} strikes (calls + puts)...")
         
         # Get option chain from provider
         try:
@@ -110,7 +111,7 @@ class ContinuousTradingMonitor:
             T = get_time_to_expiry()
             
             spot_age_val = (
-                (datetime.now() - self.trader.spot_timestamp).total_seconds()
+                (now_utc() - self.trader.spot_timestamp).total_seconds()
                 if getattr(self.trader, 'spot_timestamp', None) else 0
             )
             
@@ -237,21 +238,17 @@ class ContinuousTradingMonitor:
         
         # Scanning loop (runs in main thread)
         try:
-            last_scan = datetime.now()
+            last_scan = now_utc()
             
             while self.running:
                 # Check if market is open (9:30 AM - 4:00 PM ET)
-                now = datetime.now().time()
-                market_open = dt_time(9, 30)
-                market_close = dt_time(16, 0)
-                
-                if now < market_open or now > market_close:
-                    print(f"Market closed. Waiting... (Current time: {datetime.now().strftime('%H:%M:%S')})")
+                if not is_market_open():
+                    print(f"Market closed. Waiting... (Current time: {now_et().strftime('%H:%M:%S')} ET)")
                     time.sleep(60)
                     continue
                 
                 # Check if scan interval elapsed
-                seconds_since_scan = (datetime.now() - last_scan).seconds
+                seconds_since_scan = (now_utc() - last_scan).total_seconds()
                 
                 if seconds_since_scan >= scan_interval_seconds:
                     # For yfinance: refresh spot price each cycle
@@ -262,7 +259,7 @@ class ContinuousTradingMonitor:
                         except Exception:
                             pass
                     self.scan_strikes()
-                    last_scan = datetime.now()
+                    last_scan = now_utc()
                 
                 # Process events
                 if self._ibkr_feed:
@@ -277,7 +274,7 @@ class ContinuousTradingMonitor:
     def stop(self):
         """Stop monitoring and disconnect"""
         self.running = False
-        self.logger.summary(datetime.now().strftime('%Y-%m-%d'))
+        self.logger.summary(now_et().strftime('%Y-%m-%d'))
         self.logger.close()
         if self._ibkr_feed:
             self._ibkr_feed.disconnect()

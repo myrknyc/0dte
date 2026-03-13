@@ -1,10 +1,48 @@
 import csv
+import math
 import os
+import random
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from trading.paper_journal import PaperJournal
 from trading.paper_config import PAPER_TRADING
 from trading.backtest_metrics import BacktestMetrics
+
+
+# ── Statistical helpers (module-level) ──────────────────────
+
+
+def _wilson_ci(wins: int, total: int,
+               z: float = 1.96) -> Tuple[float, float]:
+    """Wilson score interval for a binomial proportion (returns percentages)."""
+    if total == 0:
+        return (0.0, 0.0)
+    p = wins / total
+    denom = 1 + z * z / total
+    centre = (p + z * z / (2 * total)) / denom
+    margin = (z / denom) * math.sqrt(p * (1 - p) / total
+                                      + z * z / (4 * total * total))
+    lo = max(0.0, centre - margin) * 100
+    hi = min(1.0, centre + margin) * 100
+    return (round(lo, 1), round(hi, 1))
+
+
+def _bootstrap_ci(values: List[float], n_boot: int = 5000,
+                   ci: float = 0.95) -> Tuple[float, float]:
+    """Bootstrap CI for the mean of *values*. Returns (lo, hi) in same units."""
+    if not values:
+        return (0.0, 0.0)
+    n = len(values)
+    rng = random.Random(42)   # deterministic for reproducibility
+    means = []
+    for _ in range(n_boot):
+        sample = [values[rng.randint(0, n - 1)] for _ in range(n)]
+        means.append(sum(sample) / n)
+    means.sort()
+    alpha = (1 - ci) / 2
+    lo = means[int(alpha * n_boot)]
+    hi = means[int((1 - alpha) * n_boot) - 1]
+    return (round(lo, 2), round(hi, 2))
 
 
 class EODReporter:
@@ -82,6 +120,9 @@ class EODReporter:
 
         print(f"  Trades      : {total} (BUY: {buys}, SELL: {sells})")
         print(f"  Win/Loss    : {wins}W / {losses}L ({win_rate:.1f}%)")
+        if total >= 5:
+            wr_lo, wr_hi = _wilson_ci(wins, total)
+            print(f"    95% CI    : [{wr_lo:.1f}%, {wr_hi:.1f}%]")
         print(f"  Still Open  : {len(open_trades)}")
         print(f"  Avg Hold    : {avg_hold:.1f} min")
         print(f"  Avg Edge    : {avg_edge*100:.2f}%")
@@ -92,6 +133,10 @@ class EODReporter:
         print(f"  PnL (slippage) : ${total_pnl_slip:+.2f}")
         print(f"  Profit Factor  : {profit_factor:.2f}")
         print(f"  Expectancy     : ${expectancy:+.2f}/trade")
+        if total >= 5:
+            pnl_values = [t.get('net_pnl_touch') or 0 for t in trades]
+            exp_lo, exp_hi = _bootstrap_ci(pnl_values)
+            print(f"    95% CI    : [${exp_lo:+.2f}, ${exp_hi:+.2f}]")
 
         # ── Top/Bottom 5 ──
         if trades:
@@ -100,13 +145,15 @@ class EODReporter:
                                    reverse=True)
             print(f"\n  Top 5:")
             for t in sorted_trades[:5]:
-                print(f"    {t['strike']}C {t['action']} "
+                ot = t.get('option_type', 'call')[0].upper()
+                print(f"    {t['strike']}{ot} {t['action']} "
                       f"PnL=${t.get('net_pnl_touch', 0):+.2f} "
                       f"({t.get('exit_reason', '?')})")
             if len(sorted_trades) > 5:
                 print(f"  Bottom 5:")
                 for t in sorted_trades[-5:]:
-                    print(f"    {t['strike']}C {t['action']} "
+                    ot = t.get('option_type', 'call')[0].upper()
+                    print(f"    {t['strike']}{ot} {t['action']} "
                           f"PnL=${t.get('net_pnl_touch', 0):+.2f} "
                           f"({t.get('exit_reason', '?')})")
 

@@ -760,3 +760,138 @@ class TestDecisionTimeDisplay:
         assert '10:00' in output, f"Should show 10:00 ET, got: {output}"
         assert '15:00' not in output, f"Should NOT show 15:00 UTC, got: {output}"
 
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Allowed Actions Filter (P1)
+# ═══════════════════════════════════════════════════════════════
+
+class TestAllowedActions:
+
+    def test_sell_rejected_by_allowed_actions(self, journal, config):
+        """SELL signals are rejected when allowed_actions=['BUY']."""
+        config['allowed_actions'] = ['BUY']
+        trader = PaperTrader(journal=journal, config=config)
+        sig = _make_signal(strike=590.0, action='SELL')
+        assert trader._check_eligibility_a(sig) == 'action_not_allowed'
+
+    def test_buy_allowed_by_allowed_actions(self, journal, config):
+        """BUY signals pass when allowed_actions=['BUY']."""
+        config['allowed_actions'] = ['BUY']
+        trader = PaperTrader(journal=journal, config=config)
+        sig = _make_signal(strike=590.0, action='BUY')
+        assert trader._check_eligibility_a(sig) is None
+
+    def test_no_allowed_actions_allows_all(self, journal, config):
+        """Without allowed_actions, both BUY and SELL pass."""
+        config.pop('allowed_actions', None)
+        trader = PaperTrader(journal=journal, config=config)
+        assert trader._check_eligibility_a(_make_signal(action='BUY')) is None
+        assert trader._check_eligibility_a(_make_signal(action='SELL')) is None
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Strike Concentration Limit (P1)
+# ═══════════════════════════════════════════════════════════════
+
+class TestStrikeConcentration:
+
+    def test_max_entries_per_strike(self, journal, config):
+        """Third entry on same strike is blocked by concentration limit."""
+        config['max_entries_per_strike'] = 2
+        config['max_open_positions'] = 10
+        config['max_trades_per_decision'] = 10
+        config['cooldown_minutes'] = 0
+        config.pop('allowed_actions', None)
+        trader = PaperTrader(journal=journal, config=config)
+
+        ts = datetime(2026, 2, 25, 10, 0, 0, tzinfo=_ET)
+        ts_utc = to_utc_str(ts)
+
+        # Enter 2 on same strike
+        for _ in range(2):
+            sig = _make_signal(strike=590.0, action='BUY')
+            trader._enter_trade(sig, 590.0, ts_utc, 'decision_time')
+        assert len(trader._open_trades_a) == 2
+
+        # 3rd on same strike via _make_decision_a — should be blocked
+        signals = [_make_signal(strike=590.0, action='BUY')]
+        qm = _make_quote_map((590.0, 2.0, 2.2))
+        trader._open_trades_a.clear()
+        trader._make_decision_a(signals, qm, 590.0, ts, ts_utc)
+        assert len(trader._open_trades_a) == 0
+
+
+# ═══════════════════════════════════════════════════════════════
+#  close_eod Includes Track C (P0 fix)
+# ═══════════════════════════════════════════════════════════════
+
+class TestCloseEODTrackC:
+
+    def test_close_eod_includes_track_c(self, journal, config):
+        """close_eod() force-closes Track C positions."""
+        trader = PaperTrader(journal=journal, config=config)
+
+        sig = _make_signal(strike=590.0, action='BUY')
+        ts = datetime(2026, 2, 25, 10, 0, 0, tzinfo=_ET)
+        ts_utc = to_utc_str(ts)
+        trader._enter_trade(sig, 590.0, ts_utc, 'buy_only')
+        assert len(trader._open_trades_c) == 1
+
+        eod_ts = datetime(2026, 2, 25, 15, 55, 0, tzinfo=_ET)
+        qm = _make_quote_map((590.0, 2.05, 2.15))
+        trader.close_eod(quote_map=qm, spot=590.0, ts_et=eod_ts)
+        assert len(trader._open_trades_c) == 0
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Wilson CI (statistical helper)
+# ═══════════════════════════════════════════════════════════════
+
+class TestWilsonCI:
+
+    def test_wilson_ci_basic(self):
+        """Wilson CI for 50% WR with n=100."""
+        from trading.eod_reporter import _wilson_ci
+        lo, hi = _wilson_ci(50, 100)
+        assert 38 < lo < 42
+        assert 58 < hi < 62
+
+    def test_wilson_ci_zero_total(self):
+        from trading.eod_reporter import _wilson_ci
+        assert _wilson_ci(0, 0) == (0.0, 0.0)
+
+    def test_wilson_ci_all_wins(self):
+        from trading.eod_reporter import _wilson_ci
+        lo, hi = _wilson_ci(10, 10)
+        assert lo > 50
+        assert hi == 100.0
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Option Type Display in Reporter
+# ═══════════════════════════════════════════════════════════════
+
+class TestOptionTypeDisplay:
+
+    def test_put_shows_p_not_c(self, journal, config, capsys):
+        """Reporter shows 'P' for put trades, not hardcoded 'C'."""
+        run_id = journal.start_run(config)
+        ts = '2026-02-25T15:00:00+00:00'
+
+        sig = _make_signal(strike=590.0, action='BUY')
+        sig['option_type'] = 'put'
+        fill = {'mid': 2.10, 'touch': 2.20, 'slippage': 2.22, 'spread': 0.20}
+        tid = journal.open_trade(run_id, 'decision_time', sig, fill,
+                                 590.0, ts, entry_fees=0.70)
+        pnl = {'gross_pnl': 30.0, 'net_pnl': 28.60, 'return_pct': 0.14}
+        exit_fill = {'mid': 2.40, 'touch': 2.30, 'slippage': 2.28}
+        journal.close_trade(tid, 2.30, 2.50, exit_fill, 591.0, ts,
+                            'time_exit', pnl, pnl, pnl, 5.0, exit_fees=0.70)
+
+        reporter = EODReporter(journal, config)
+        reporter._print_track_summary(run_id, 'decision_time')
+
+        output = capsys.readouterr().out
+        assert '590.0P' in output, f"Expected '590.0P' in output, got: {output}"
+        assert '590.0C' not in output, f"Should NOT show '590.0C', got: {output}"

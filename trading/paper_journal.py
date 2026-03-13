@@ -7,28 +7,16 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any
 from zoneinfo import ZoneInfo
 
+# Centralised clock — canonical source of timezone-aware time
+from core.clock import (
+    now_et,       # -> datetime  (ET-aware)
+    now_utc_str as now_utc,  # -> str (UTC ISO)
+    to_utc_str,   # datetime -> str
+    ET as _ET,
+    UTC as _UTC,
+)
+
 SCHEMA_VERSION = 2
-_ET = ZoneInfo('America/New_York')
-_UTC = ZoneInfo('UTC')
-
-
-def now_utc() -> str:
-    """Current time as UTC ISO-8601 string."""
-    return datetime.now(_UTC).isoformat()
-
-
-def now_et() -> datetime:
-    """Current time as timezone-aware ET datetime."""
-    return datetime.now(_ET)
-
-
-def to_utc_str(dt) -> str:
-    """Convert any datetime to UTC ISO string."""
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=_ET)
-    return dt.astimezone(_UTC).isoformat()
 
 
 class PaperJournal:
@@ -514,6 +502,28 @@ class PaperJournal:
             'avg_edge': sum(t.get('edge_entry') or 0 for t in trades) / len(trades),
             'avg_confidence': sum(t.get('confidence_entry') or 0 for t in trades) / len(trades),
         }
+
+    # ── DB maintenance ────────────────────────────────────────
+    def purge_old_quotes(self, days: int = 7) -> int:
+        """Delete option_quotes older than *days*. Returns rows deleted."""
+        cutoff = (datetime.now(_UTC) - __import__('datetime').timedelta(days=days)).isoformat()
+        cur = self.conn.execute(
+            "DELETE FROM option_quotes WHERE timestamp_utc < ?", (cutoff,)
+        )
+        deleted = cur.rowcount
+        self.conn.commit()
+        return deleted
+
+    def vacuum(self):
+        """Reclaim disk space after bulk deletes."""
+        self.conn.execute("VACUUM")
+
+    def maintenance(self, retention_days: int = 7):
+        """Run routine maintenance: purge + vacuum."""
+        deleted = self.purge_old_quotes(retention_days)
+        if deleted > 0:
+            self.vacuum()
+        return deleted
 
     def close(self):
         self.conn.close()

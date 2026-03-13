@@ -70,6 +70,10 @@ def config():
         'use_eu_scoring': True,
         'use_regime_thresholds': False,
         'selection_policy': 'eu_ranked',
+        'exit_mode': 'hybrid',
+        'exit_time_minutes': 30,
+        'tp_pct': 0.25,
+        'sl_pct': 0.20,
         'filters': {
             'min_confidence': 0.50,
             'min_edge': 0.02,

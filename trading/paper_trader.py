@@ -2,14 +2,16 @@ from datetime import datetime, date, timedelta, time as dt_time
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 import json
+import logging
 
+from core.clock import now_et, now_utc, now_utc_str, to_utc_str, ET as _ET
 from trading.paper_config import PAPER_TRADING
 from trading.fill_model import simulate_fill, compute_fees, compute_pnl
 from trading.fill_model import _fees_per_contract, _compute_slippage
-from trading.paper_journal import PaperJournal, now_utc, to_utc_str
+from trading.paper_journal import PaperJournal
 from calibration.probability_calibrator import ProbabilityCalibrator
 
-_ET = ZoneInfo('America/New_York')
+logger = logging.getLogger(__name__)
 
 
 class PaperTrader:
@@ -30,6 +32,7 @@ class PaperTrader:
         self._open_trades_b: Dict[str, dict] = {}
         self._open_trades_c: Dict[str, dict] = {}  # Track C: buy-only
         self._trade_close_times: Dict[str, datetime] = {}  # last close per (strike, action, track)
+        self._strike_entry_counts: Dict[str, Dict[float, int]] = {}  # track → {strike → count}
 
         # H2 scaffold: probability calibrator (passthrough by default)
         self._calibrator = ProbabilityCalibrator()
@@ -37,6 +40,9 @@ class PaperTrader:
         # Current regime (set per scan by on_scan or _make_decision_a)
         self._current_regime = 'unknown'
         self._intraday_move_pct = None
+
+        # Crash recovery: reload any OPEN trades from DB
+        self._load_open_trades()
 
     # ================================================================== #
     #  Main entry point                                                    #
@@ -85,6 +91,65 @@ class PaperTrader:
         # 5. Check exits for all tracks
         self._check_exits(quote_map, timestamp_et, ts_utc)
 
+    # ================================================================== #
+    #  Crash recovery                                                       #
+    # ================================================================== #
+
+    def _load_open_trades(self):
+        """Hydrate in-memory trade caches from DB (crash recovery)."""
+        open_trades = self.journal.get_open_trades(self.run_id)
+        # Note: on a fresh run_id there are no open trades.
+        # This is primarily for future restart-same-run support.
+        # For now, also check the *most recent* run for orphaned opens.
+        if not open_trades:
+            # Look for orphaned OPEN trades from any prior run
+            rows = self.journal.conn.execute(
+                "SELECT * FROM paper_trades WHERE status = 'OPEN' "
+                "ORDER BY entry_timestamp_utc DESC"
+            ).fetchall()
+            if rows:
+                logger.warning(
+                    "Found %d orphaned OPEN trades from prior runs. "
+                    "Consider running reconciliation.", len(rows)
+                )
+            return
+
+        loaded = {'decision_time': 0, 'all_signals': 0, 'buy_only': 0}
+        for t in open_trades:
+            trade = {
+                'trade_id': t['trade_id'],
+                'strike': t['strike'],
+                'action': t['action'],
+                'option_type': t.get('option_type', 'call'),
+                'entry_timestamp_utc': t['entry_timestamp_utc'],
+                'entry_fill': {
+                    'mid': t.get('entry_fill_mid', 0),
+                    'touch': t.get('entry_fill_touch', 0),
+                    'slippage': t.get('entry_fill_slippage', 0),
+                    'spread': t.get('entry_spread', 0),
+                },
+                'quantity': t.get('quantity', 1),
+                'entry_fees': t.get('entry_fees', 0),
+                'track': t['track'],
+            }
+            track = t['track']
+            tid = t['trade_id']
+            if track == 'decision_time':
+                self._open_trades_a[tid] = trade
+            elif track == 'buy_only':
+                self._open_trades_c[tid] = trade
+            else:
+                self._open_trades_b[tid] = trade
+            loaded[track] = loaded.get(track, 0) + 1
+
+        total = sum(loaded.values())
+        if total > 0:
+            logger.info(
+                "Crash recovery: loaded %d open trades (A:%d B:%d C:%d)",
+                total, loaded['decision_time'],
+                loaded['all_signals'], loaded['buy_only']
+            )
+
     
     def _make_decision_a(self, signals: List[dict], quote_map: Dict,
                          spot: float, ts_et: datetime, ts_utc: str):
@@ -124,6 +189,7 @@ class PaperTrader:
         selected = ranked[:max(0, slots)]
 
         # ── Enter ──
+        max_per_strike = self.cfg.get('max_entries_per_strike', 0)
         n_entered = 0
         for sig in selected:
             # Cooldown check
@@ -131,6 +197,14 @@ class PaperTrader:
                 rejections['cooldown'] = rejections.get('cooldown', 0) + 1
                 self.journal.log_skip(track, sig, 'cooldown')
                 continue
+            # Per-strike concentration limit
+            if max_per_strike > 0:
+                strike = sig.get('strike')
+                counts = self._strike_entry_counts.setdefault(track, {})
+                if counts.get(strike, 0) >= max_per_strike:
+                    rejections['strike_concentration'] = rejections.get('strike_concentration', 0) + 1
+                    self.journal.log_skip(track, sig, 'strike_concentration')
+                    continue
             self._enter_trade(sig, spot, ts_utc, track, decision_ts=ts_utc)
             n_entered += 1
 
@@ -162,6 +236,11 @@ class PaperTrader:
 
         if action == 'HOLD':
             return 'hold_signal'
+
+        # Action whitelist (e.g. disable SELL for Track A)
+        allowed = self.cfg.get('allowed_actions')
+        if allowed and action not in allowed:
+            return 'action_not_allowed'
         if sig.get('confidence', 0) < f.get('min_confidence', 0):
             return 'low_confidence'
         if sig.get('edge', 0) < f.get('min_edge', 0):
@@ -179,6 +258,13 @@ class PaperTrader:
         max_mid = f.get('max_option_mid')
         if max_mid and mid > max_mid:
             return 'option_too_expensive'
+
+        # Q4: reject sub-dime model prices — MC noise dominates edge
+        min_model = f.get('min_model_price')
+        if min_model is not None:
+            model_price = sig.get('model_price', 0) or 0
+            if model_price < min_model:
+                return 'model_price_too_low'
 
         spot_age = sig.get('spot_age_seconds')
         if spot_age is not None and spot_age > f.get('max_spot_age_seconds', 999):
@@ -496,6 +582,11 @@ class PaperTrader:
             'entry_fees': fees,
             'track': track,
         }
+        # Track per-strike entry count
+        counts = self._strike_entry_counts.setdefault(track, {})
+        strike_val = sig.get('strike')
+        counts[strike_val] = counts.get(strike_val, 0) + 1
+
         if track == 'decision_time':
             self._open_trades_a[trade_id] = trade
             print(f"\n  >>> PAPER TRADE ENTERED [Track A] <<<")
@@ -1014,32 +1105,32 @@ class PaperTrader:
                   spot: float = 0, ts_et: datetime = None):
         """Force-close all remaining open trades at EOD."""
         if ts_et is None:
-            ts_et = datetime.now(_ET)
+            ts_et = now_et()
         ts_utc = to_utc_str(ts_et)
 
-        for trade_id, trade in list(self._open_trades_a.items()):
-            strike = trade['strike']
-            q = (quote_map or {}).get(strike, {})
-            exit_bid = q.get('bid', trade['entry_fill'].get('touch', 0))
-            exit_ask = q.get('ask', trade['entry_fill'].get('touch', 0))
-            entry_ts = datetime.fromisoformat(trade['entry_timestamp_utc'])
-            if entry_ts.tzinfo is None:
-                entry_ts = entry_ts.replace(tzinfo=ZoneInfo('UTC'))
-            hold = (ts_et.astimezone(ZoneInfo('UTC')) - entry_ts).total_seconds() / 60.0
-            self._close_trade(trade_id, trade, exit_bid, exit_ask,
-                              spot, ts_utc, 'eod_exit', hold)
-
-        for trade_id, trade in list(self._open_trades_b.items()):
-            strike = trade['strike']
-            q = (quote_map or {}).get(strike, {})
-            exit_bid = q.get('bid', trade['entry_fill'].get('touch', 0))
-            exit_ask = q.get('ask', trade['entry_fill'].get('touch', 0))
-            entry_ts = datetime.fromisoformat(trade['entry_timestamp_utc'])
-            if entry_ts.tzinfo is None:
-                entry_ts = entry_ts.replace(tzinfo=ZoneInfo('UTC'))
-            hold = (ts_et.astimezone(ZoneInfo('UTC')) - entry_ts).total_seconds() / 60.0
-            self._close_trade(trade_id, trade, exit_bid, exit_ask,
-                              spot, ts_utc, 'eod_exit', hold)
+        # Single loop over all tracks
+        all_caches = [
+            self._open_trades_a,
+            self._open_trades_b,
+            self._open_trades_c,
+        ]
+        for cache in all_caches:
+            for trade_id, trade in list(cache.items()):
+                strike = trade['strike']
+                opt_type = trade.get('option_type', 'call')
+                # Look up quote by (strike, type) tuple first, then plain strike
+                q = (
+                    (quote_map or {}).get((strike, opt_type))
+                    or (quote_map or {}).get(strike, {})
+                )
+                exit_bid = q.get('bid', trade['entry_fill'].get('touch', 0))
+                exit_ask = q.get('ask', trade['entry_fill'].get('touch', 0))
+                entry_ts = datetime.fromisoformat(trade['entry_timestamp_utc'])
+                if entry_ts.tzinfo is None:
+                    entry_ts = entry_ts.replace(tzinfo=ZoneInfo('UTC'))
+                hold = (ts_et.astimezone(ZoneInfo('UTC')) - entry_ts).total_seconds() / 60.0
+                self._close_trade(trade_id, trade, exit_bid, exit_ask,
+                                  spot, ts_utc, 'eod_exit', hold)
 
         self.journal.end_run(self.run_id)
 
